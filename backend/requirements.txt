@@ -1,0 +1,11 @@
+Flask
+Flask-Cors
+Flask-JWT-Extended
+SQLAlchemy
+Flask-SocketIO
+eventlet
+langchain
+langgraph
+requests
+python-dotenv
+pydantic
