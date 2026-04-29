@@ -8,7 +8,7 @@ def setup_hospital():
     data = request.get_json()
     if not data:
         return jsonify({"message": "No data provided"}), 400
-    must = ["name", "location", "icu_available", "ventilators_available", "beds_available", "capacity"]
+    must = ["name", "location", "icu_available", "ventilators_available", "beds_available", "capacity", "has_cardiology", "has_trauma_care", "lattitude", "longitude"]
     for field in must:
         if field not in data:
             return jsonify({"message": f"Missing required field: {field}"}), 400
@@ -19,7 +19,11 @@ def setup_hospital():
         ventilators_available=data.get('ventilators_available'),
         beds_available=data.get('beds_available'),
         capacity=data.get('capacity'),
-        created_at=data.get('created_at')
+        created_at=data.get('created_at'),
+        has_cardiology = data.get('has_cardiology'),
+        has_trauma_care = data.get('has_trauma_care'),
+        lattitude = data.get('lattitude'),
+        longitude = data.get('longitude')
     )
 
     db.session.add(new_hospital)

@@ -42,3 +42,22 @@ def update_status(ambulance_id):
         db.session.rollback()
         return jsonify({"message": "Error updating status"}), 500
     return jsonify({"message": "Status updated successfully", "ambulance_id": ambulance.id,"status":ambulance.status}), 200
+
+#update location
+@ambulance.route('/update-location/<ambulance_id>', methods=['POST'])
+def update_location(ambulance_id):
+    data = request.get_json()
+    ambulance = Ambulance.query.get(ambulance_id)
+    if not ambulance:
+        return jsonify({"message": "Ambulance not found"}), 404
+    if "lattitude" and "longitude" in data:
+        ambulance.lattitude = data["lattitude"]
+        ambulance.longitude = data["longitude"]
+    else:
+        return jsonify({"message": "lattitude and longitude are required"}), 400
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "Error updating location"}), 500
+    return jsonify({"message": "Location updated successfully", "ambulance_id": ambulance.id,"lattitude":ambulance.lattitude, "longitude":ambulance.longitude}), 200
