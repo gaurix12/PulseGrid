@@ -3,7 +3,7 @@ from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
 from langchain_core.language_models.llms import LLM
 from ..models import Hospital, db, Case, Ambulance, Logs
 import math
-
+# case->hospital
 class HospitalSelectionAgent:
     def __init__(self, llm:LLM):
         self.llm = llm

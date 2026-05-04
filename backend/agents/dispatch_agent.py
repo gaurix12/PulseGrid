@@ -3,7 +3,7 @@ from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
 import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from ..models import Ambulance, Case, Hospital, Logs, db
-
+# case ->ambulance,hospital
 class DispatchAgent:
     def __init__(self, llm: Any = None):
         self.llm = llm

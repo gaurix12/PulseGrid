@@ -1,5 +1,4 @@
-"""Alert Agent - routes notifications to hospital staff, ambulance crews, and admins based on severity.
-
+"""
 Alert routing rules:
 - P0 (Critical): Alert hospital staff + ambulance crew + admins
 - P1 (High): Alert hospital staff + ambulance crew
@@ -17,7 +16,6 @@ class AlertAgent:
     def __init__(self, llm: Any = None):
         self.llm = llm
         
-        # Set up output parser for LLM responses
         self.response_schemas = [
             ResponseSchema(name='alerts', description='List of alert objects: [{"user_id": N, "recipient_type": "hospital"/"ambulance"/"admin", "message": "..."}]'),
             ResponseSchema(name='priority', description='Alert priority level: high/medium/low'),
@@ -92,7 +90,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
             except Exception as e:
                 llm_decision = None
 
-        # Execute alerts with LLM or fallback
         if llm_decision:
             result = self._execute_llm_alerts(case, llm_decision, alerts_to_send)
         else:
@@ -102,7 +99,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
         return result
 
     def _determine_alert_recipients(self, severity_level: str) -> List[str]:
-        """Determine which recipient types should receive alerts."""
         recipients = {
             'P0': ['hospital', 'ambulance', 'admin'],
             'P1': ['hospital', 'ambulance'],
@@ -112,7 +108,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
         return recipients.get(severity_level, [])
 
     def _execute_llm_alerts(self, case: Case, llm_decision: Dict, recipient_types: List[str]) -> Dict[str, Any]:
-        """Execute alerts using LLM-generated messages."""
         alerts = llm_decision.get('alerts', [])
         if isinstance(alerts, str):
             import json
@@ -129,7 +124,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
             recipient_type = alert.get('recipient_type')
             message = alert.get('message')
 
-            # Verify user exists and matches recipient type
             if user_id and recipient_type and message:
                 user = User.query.get(user_id)
                 if user and user.role in self._role_for_recipient_type(recipient_type):
@@ -145,7 +139,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
                         "reason": "Invalid user or role mismatch"
                     })
 
-        # Log alerts sent
         log = Logs(
             case_id=case.id,
             agent_name='alert_agent',
@@ -169,7 +162,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
         """Execute alerts using deterministic rule-based messages."""
         sent_alerts = []
 
-        # Find relevant users based on recipient type
         for recipient_type in recipient_types:
             if recipient_type == 'hospital' and case.hospital:
                 # Alert all hospital staff at assigned hospital
@@ -187,7 +179,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
                     })
 
             elif recipient_type == 'ambulance' and case.ambulance:
-                # Alert ambulance crew
                 ambulance_crew = User.query.filter_by(
                     ambulance_id=case.ambulance.id,
                     role='ambulance'
@@ -213,7 +204,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
                         "case_id": case.id
                     })
 
-        # Log deterministic alerts sent
         log = Logs(
             case_id=case.id,
             agent_name='alert_agent',
@@ -232,20 +222,16 @@ Determine who needs to be alerted and compose concise, actionable alert messages
         }
 
     def _generate_hospital_message(self, case: Case) -> str:
-        """Generate alert message for hospital staff."""
         resource_status = self._get_resource_status(case)
         return f"ALERT: {case.severity} case received. Patient condition: {case.condition}. Location: {case.location}. Resources needed: {resource_status}"
 
     def _generate_ambulance_message(self, case: Case) -> str:
-        """Generate alert message for ambulance crew."""
         return f"DISPATCH: Case {case.id} - {case.condition}. Patient at {case.location}. Severity: {case.severity}. Hospital: {case.hospital.name if case.hospital else 'TBD'}"
 
     def _generate_admin_message(self, case: Case) -> str:
-        """Generate alert message for system admins."""
         return f"CRITICAL ALERT: Case {case.id} ({case.severity}) - Patient: {case.patient_name}, Condition: {case.condition}, Location: {case.location}. Ambulance: {case.ambulance.id if case.ambulance else 'Unassigned'}, Hospital: {case.hospital.name if case.hospital else 'Unassigned'}"
 
     def _get_resource_status(self, case: Case) -> str:
-        """Get human-readable summary of resource allocations."""
         if not case.hospital:
             return "Hospital not yet assigned"
 
@@ -256,7 +242,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
         return ", ".join([f"{n['quantity']} {n['type']}" for n in needs])
 
     def _role_for_recipient_type(self, recipient_type: str) -> List[str]:
-        """Map recipient type to valid user roles."""
         mapping = {
             'hospital': ['hospital'],
             'ambulance': ['ambulance'],
