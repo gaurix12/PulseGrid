@@ -3,6 +3,7 @@ from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
 import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from ..models import Ambulance, Case, Hospital, Logs, db
+from ..tools.langchain_tools import recommend_ambulance_for_case, recommend_hospital_for_case
 # case ->ambulance,hospital
 class DispatchAgent:
     def __init__(self, llm: Any = None):
@@ -73,35 +74,42 @@ Return ONLY valid JSON that matches the format instructions below.
         return r * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
     
     def dispatch(self, case, location):
-        ambulances = Ambulance.query.filter_by(status='idle').all()
-        if not ambulances:
-            ambulances = Ambulance.query.filter(Ambulance.status == 'assigned').all()
-        hospitals = Hospital.query.filter(
-            Hospital.beds_available > 0,
-            Hospital.icu_available > 0,
-            Hospital.ventilators_available > 0,
-            Hospital.capacity > Hospital.current_patients
-        ).all()
-        ambulances = self.format_ambulances(ambulances, location)
-        hospitals = self.format_hospitals(hospitals, location)
-        prompt = self.prompt.format(patient_name=case.patient_name,
-                                    condition=case.condition,
-                                    severity=case.severity,
-                                    location=location,
-                                    ambulances=ambulances,
-                                    hospitals=hospitals,
-                                    format_instructions=self.format_instructions)
         try:
-            response = self.llm.invoke(prompt)
-            text = response if isinstance(response, str) else response.content
-            result = self.out_parser.parse(text)
+            if not getattr(case, "severity", None):
+                return {
+                    "ambulance_id": None,
+                    "hospital_id": None,
+                    "reasoning": "Case severity is missing. Triaging must complete before dispatch.",
+                }
+
+            ambulance_recommendation = recommend_ambulance_for_case.invoke({"case_id": case.id, "top_k": 1})
+            hospital_recommendation = recommend_hospital_for_case.invoke({"case_id": case.id, "top_k": 1})
+
+            ambulance_candidates = ambulance_recommendation.get("recommended", []) if ambulance_recommendation.get("success") else []
+            hospital_candidates = hospital_recommendation.get("recommended", []) if hospital_recommendation.get("success") else []
+
+            if not ambulance_candidates or not hospital_candidates:
+                return self.fallback(case, location)
+
+            chosen_ambulance = ambulance_candidates[0]
+            chosen_hospital = hospital_candidates[0]
+
+            result = {
+                "ambulance_id": chosen_ambulance["ambulance_id"],
+                "hospital_id": chosen_hospital["hospital_id"],
+                "reasoning": (
+                    f"Selected by ranking tools. Ambulance score={chosen_ambulance.get('score')} "
+                    f"reasons={', '.join(chosen_ambulance.get('reasons', []))}. "
+                    f"Hospital score={chosen_hospital.get('score')} reasons={', '.join(chosen_hospital.get('reasons', []))}."
+                ),
+            }
             
             # Log the dispatch decision
             log = Logs(
                 case_id=case.id,
                 agent_name='dispatch_agent',
                 message=f"Dispatched ambulance {result.get('ambulance_id')} to hospital {result.get('hospital_id')}",
-                metadata=result.get('reasoning', 'LLM-based dispatch')
+                metadata=result.get('reasoning', 'ranking-tool-based dispatch')
             )
             db.session.add(log)
             db.session.commit()
@@ -130,57 +138,39 @@ Return ONLY valid JSON that matches the format instructions below.
 
     #fallback: simple rules - nearest ambulance, hospital with resources, log reasoning for audit
     def fallback(self, case, location):
-        ambulances = Ambulance.query.filter_by(status='idle').all()
-        if not ambulances:
-            ambulances = Ambulance.query.filter(Ambulance.status == 'assigned').all()
-        hospitals = Hospital.query.filter(
-            Hospital.beds_available > 0,
-            Hospital.icu_available > 0,
-            Hospital.ventilators_available > 0,
-            Hospital.capacity > Hospital.current_patients
-        ).all()
+        ambulance_recommendation = recommend_ambulance_for_case.invoke({"case_id": case.id, "top_k": 1})
+        hospital_recommendation = recommend_hospital_for_case.invoke({"case_id": case.id, "top_k": 1})
 
-        if not ambulances or not hospitals:
+        ambulance_candidates = ambulance_recommendation.get("recommended", []) if ambulance_recommendation.get("success") else []
+        hospital_candidates = hospital_recommendation.get("recommended", []) if hospital_recommendation.get("success") else []
+
+        if not ambulance_candidates or not hospital_candidates:
             return {"ambulance_id": None, "hospital_id": None, "reasoning": "No available ambulance or hospital found."}
 
-        def ambulance_location(amb):
-            return f"{amb.current_latitude},{amb.current_longitude}"
+        chosen_ambulance = ambulance_candidates[0]
+        chosen_hospital = hospital_candidates[0]
 
-        def hospital_location(hosp):
-            hosp_lat = getattr(hosp, 'lattitude', None)
-            if hosp_lat is None:
-                hosp_lat = getattr(hosp, 'latitude', None)
-            return f"{hosp_lat},{hosp.longitude}"
+        reasoning_parts = [
+            f"Ambulance ranking selected {chosen_ambulance['ambulance_id']} with score {chosen_ambulance.get('score')}",
+            f"Hospital ranking selected {chosen_hospital['hospital_id']} with score {chosen_hospital.get('score')}",
+        ]
 
-        nearest_ambulance = min(
-            ambulances,
-            key=lambda amb: self.calculate_distance(ambulance_location(amb), location)
-        )
+        if ambulance_recommendation.get("recommended"):
+            reasoning_parts.append(f"ambulance reasons: {', '.join(chosen_ambulance.get('reasons', []))}")
+        if hospital_recommendation.get("recommended"):
+            reasoning_parts.append(f"hospital reasons: {', '.join(chosen_hospital.get('reasons', []))}")
 
-        if case.severity in ('P0', 'P1'):
-            suitable_hospitals = [h for h in hospitals if h.icu_available > 0 and h.ventilators_available > 0]
-        else:
-            suitable_hospitals = [h for h in hospitals if h.beds_available > 0]
+        reasoning = " | ".join(reasoning_parts)
 
-        if not suitable_hospitals:
-            suitable_hospitals = hospitals
-
-        chosen_hospital = min(
-            suitable_hospitals,
-            key=lambda h: self.calculate_distance(hospital_location(h), location)
-        )
-        reasoning = f"Fallback: Chose ambulance {nearest_ambulance.id} and hospital {chosen_hospital.id} based on proximity and resource availability."
-        
-        # Log the fallback dispatch decision
         log = Logs(
             case_id=case.id,
             agent_name='dispatch_agent',
-            message=f"Fallback dispatch: ambulance {nearest_ambulance.id} to hospital {chosen_hospital.id}",
+            message=f"Fallback dispatch used ranking tools: ambulance {chosen_ambulance['ambulance_id']} to hospital {chosen_hospital['hospital_id']}",
             metadata=reasoning
         )
         db.session.add(log)
         db.session.commit()
-        
-        return {"ambulance_id": nearest_ambulance.id, "hospital_id": chosen_hospital.id, "reasoning": reasoning}
+
+        return {"ambulance_id": chosen_ambulance["ambulance_id"], "hospital_id": chosen_hospital["hospital_id"], "reasoning": reasoning}
 
     

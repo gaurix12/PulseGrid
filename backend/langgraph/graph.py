@@ -1,3 +1,5 @@
+import json
+
 from ..models import Case,db, Logs, Hospital, Ambulance
 from langgraph.graph import StateGraph, START,END
 from langchain.chat_models import init_chat_model
@@ -8,6 +10,7 @@ from ..agents.dispatch_agent import DispatchAgent
 from ..agents.hospital_selection_agent import HospitalSelectionAgent
 from ..agents.resource_allocation_agent import ResourceAllocationAgent
 from ..agents.chat_agent import ChatAgent
+from ..tools.langchain_tools import invoke_tool
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 class EmergencyDispatchGraph:
@@ -42,6 +45,36 @@ class EmergencyDispatchGraph:
 
         graph = graph_builder.compile()
         return graph
+
+    def build_chat_graph(self) -> StateGraph:
+        graph_builder = StateGraph(EmergencyState)
+        graph_builder.add_node("chat", self.chat_node)
+        graph_builder.add_node("finalise", self.finalise_node)
+
+        graph_builder.add_edge(START, "chat")
+        graph_builder.add_edge("chat", "finalise")
+        graph_builder.add_edge("finalise", END)
+
+        return graph_builder.compile()
+
+    def _log_state_snapshot(self, state: EmergencyState, stage: str) -> None:
+        if not state:
+            return
+
+        snapshot = state.to_dict() if hasattr(state, "to_dict") else {}
+        log = Logs(
+            case_id=state.case_id,
+            agent_name="workflow_state_snapshot",
+            message=f"EmergencyState snapshot after {stage}",
+            metadata=json.dumps({
+                "stage": stage,
+                "workflow_status": state.workflow_status,
+                "case_status": state.case_status,
+                "snapshot": snapshot,
+            }, default=str),
+        )
+        db.session.add(log)
+        db.session.commit()
     
     def triage_node(self, state: EmergencyState) -> EmergencyState:
         
@@ -54,6 +87,48 @@ class EmergencyDispatchGraph:
             state.severity = triage_result.get('severity')
             state.condition = triage_result.get('condition')
             state.created_at = datetime.utcnow()
+            state.case_status = 'triaged'
+            state.workflow_status = 'triaged'
+
+            if not state.case_id:
+                patient_name = state.patient_name or "Unknown Patient"
+                condition = state.condition or state.metadata.get('condition', 'Unknown')
+                severity = state.severity or 'P3'
+                location = state.location or state.metadata.get('location', 'Unknown')
+
+                new_case = Case(
+                    patient_name=patient_name,
+                    condition=condition,
+                    severity=severity,
+                    location=location,
+                    status='triaged'
+                )
+                db.session.add(new_case)
+                db.session.commit()
+
+                state.case_id = new_case.id
+                state.patient_name = new_case.patient_name
+                state.condition = new_case.condition
+                state.severity = new_case.severity
+                state.location = new_case.location
+                state.case_status = new_case.status
+
+                log = Logs(
+                    case_id=new_case.id,
+                    agent_name='triage_node',
+                    message=f"Case created during triage: severity={state.severity}, condition={state.condition}",
+                    metadata=''
+                )
+                db.session.add(log)
+                db.session.commit()
+                
+                state.logs.append({
+                    "agent": "triage_node",
+                    "message": f"Case created during triage: severity={state.severity}, condition={state.condition}",
+                    "metadata": ""
+                })
+                self._log_state_snapshot(state, "triage")
+                return state
 
             state.logs.append({
                 "agent": "triage_agent",
@@ -61,36 +136,49 @@ class EmergencyDispatchGraph:
                 "metadata": ""
             })
 
+            self._log_state_snapshot(state, "triage")
+
             return state
         except Exception as e:
             state.error_message = str(e)
+            self._log_state_snapshot(state, "triage_error")  # Issue #11: Log error state
             return state
 
     def create_case_node(self, state: EmergencyState) -> EmergencyState:
         try:
-            patient_name = state.patient_name or "Unknown Patient"
-            condition = state.condition or state.metadata.get('condition', 'Unknown')
-            severity = state.severity or 'P3'
-            location = state.location or state.metadata.get('location', 'Unknown')
-            new_case = Case(
-                patient_name=patient_name,
-                condition=condition,
-                severity=severity,
-                location=location
-            )
-            db.session.add(new_case)
-            db.session.commit()
+            if state.case_id:
+                existing_case = Case.query.get(state.case_id)
+                if not existing_case:
+                    state.error_message = f'Case {state.case_id} not found'
+                    return state
 
-            state.case_id = new_case.id
-            for l in state.logs:
-                log = Logs(case_id=new_case.id, agent_name=l.get('agent', 'system'), message=l.get('message', ''), metadata=l.get('metadata', None))
-                db.session.add(log)
-            db.session.commit()
-            state.workflow_status = 'case_created'
+                if state.patient_name:
+                    existing_case.patient_name = state.patient_name
+                if state.condition:
+                    existing_case.condition = state.condition
+                if state.severity:
+                    existing_case.severity = state.severity
+                if state.location:
+                    existing_case.location = state.location
+                if not existing_case.status or existing_case.status == 'created':
+                    existing_case.status = 'triaged'
+
+                db.session.add(existing_case)
+                db.session.commit()
+
+                state.patient_name = existing_case.patient_name
+                state.condition = existing_case.condition
+                state.severity = existing_case.severity
+                state.location = existing_case.location
+                state.case_status = existing_case.status
+                state.workflow_status = 'triaged'
+                return state
+
             return state
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
+            self._log_state_snapshot(state, "create_case_error")  # Issue #11: Log error state
             return state
 
     def dispatch_node(self, state: EmergencyState) -> EmergencyState:
@@ -99,7 +187,7 @@ class EmergencyDispatchGraph:
                 state.error_message = 'No case_id present for dispatch'
                 return state
 
-            case = Case.query.get(state.case_id)
+            case = Case.query.with_for_update().get(state.case_id)  # Issue #13: Pessimistic locking
             if not case:
                 state.error_message = f'Case {state.case_id} not found'
                 return state
@@ -107,30 +195,48 @@ class EmergencyDispatchGraph:
             amb_id = dispatch_result.get('ambulance_id')
             hosp_id = dispatch_result.get('hospital_id')
 
-            if amb_id:
-                case.ambulance_id = amb_id
-                # optional: mark ambulance as assigned
-                amb = Ambulance.query.get(amb_id)
-                if amb:
-                    amb.status = 'assigned'
-                    amb.current_case_id = case.id
-                    db.session.add(amb)
-
             if hosp_id:
                 case.hospital_id = hosp_id
 
+            assignment_result = None
+            if amb_id:
+                assignment_result = invoke_tool(
+                    "assign_ambulance_to_case",
+                    user_role="admin",
+                    ambulance_id=amb_id,
+                    case_id=case.id,
+                )
+                if not assignment_result.get('success'):
+                    db.session.rollback()
+                    state.error_message = assignment_result.get('error', 'Failed to assign ambulance to case')
+                    return state
+
+            case.status = 'dispatched'
+
             db.session.add(case)
-            log = Logs(case_id=case.id, agent_name='dispatch_node', message=f"Dispatch result: ambulance={amb_id}, hospital={hosp_id}", metadata=dispatch_result.get('reasoning', ''))
+            log = Logs(
+                case_id=case.id,
+                agent_name='dispatch_node',
+                message=f"Dispatch result: ambulance={amb_id}, hospital={hosp_id}",
+                metadata=str({
+                    "dispatch_reasoning": dispatch_result.get('reasoning', ''),
+                    "assignment_result": assignment_result,
+                }),
+            )
             db.session.add(log)
             db.session.commit()
-            state.ambulance_id = amb_id
+            state.ambulance_id = assignment_result.get('ambulance_id', amb_id) if assignment_result else amb_id
             state.hospital_id = hosp_id
             state.dispatch_reasoning = dispatch_result.get('reasoning')
             state.workflow_status = 'dispatched'
+            state.case_status = case.status
+
+            self._log_state_snapshot(state, "dispatch")
             return state
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
+            self._log_state_snapshot(state, "dispatch_error")  # Issue #11: Log error state
             return state
 
     def hospital_selection_node(self, state: EmergencyState) -> EmergencyState:
@@ -143,29 +249,66 @@ class EmergencyDispatchGraph:
             if not case:
                 state.error_message = f'Case {state.case_id} not found'
                 return state
-
+            
+            if state.hospital_id:
+                if case.status == 'dispatched':
+                    case.status = 'arrived'
+                    db.session.add(case)
+                    db.session.commit()
+                
+                log = Logs(
+                    case_id=case.id,
+                    agent_name='hospital_selection_node',
+                    message=f"Hospital selection skipped: already assigned by dispatch node",
+                    metadata=json.dumps({
+                        "hospital_id": state.hospital_id,
+                        "hospital_name": state.hospital_name,
+                        "source": "dispatch_node",
+                        "skipped": True,
+                        "stage": "hospital_selection"
+                    }, default=str)
+                )
+                db.session.add(log)
+                db.session.commit()
+                
+                state.workflow_status = 'arrived'
+                state.case_status = case.status
+                return state
+            
             sel_result = self.hospital_selection_agent.select_hospital(case)
             hosp_id = sel_result.get('hospital_id')
             reasoning = sel_result.get('reasoning')
 
             if hosp_id:
                 case.hospital_id = hosp_id
+                case.status = 'arrived'
                 db.session.add(case)
                 db.session.commit()
 
                 hosp = Hospital.query.get(hosp_id)
                 state.hospital_id = hosp_id
                 state.hospital_name = hosp.name if hosp else None
-            log = Logs(case_id=case.id, agent_name='hospital_selection_node', message=f"Hospital selected: {hosp_id}", metadata=reasoning)
-            db.session.add(log)
-            db.session.commit()
+                state.hospital_selection_reasoning = reasoning
+                
+                log = Logs(
+                    case_id=case.id,
+                    agent_name='hospital_selection_node',
+                    message=f"Hospital selected: {hosp_id}",
+                    metadata=reasoning
+                )
+                db.session.add(log)
+                db.session.commit()
+            else:
+                state.error_message = f"Hospital selection failed: no suitable hospital found. Reasoning: {reasoning}"
+                return state
 
-            state.hospital_selection_reasoning = reasoning
-            state.workflow_status = 'hospital_selected'
+            state.workflow_status = 'arrived'
+            state.case_status = case.status
             return state
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
+            self._log_state_snapshot(state, "hospital_selection_error")  # Issue #11: Log error state
             return state
 
     def resource_allocation_node(self, state: EmergencyState) -> EmergencyState:
@@ -188,17 +331,25 @@ class EmergencyDispatchGraph:
             state.llm_rationale = alloc_result.get('llm_rationale')
             state.alternative_strategy = alloc_result.get('alternative_strategy')
             state.escalation_needed = alloc_result.get('escalation_needed', False)
+            if not state.allocation_success:
+                state.error_message = f"Resource allocation failed: {state.allocation_reasoning}"
+                return state
+            case.status = 'resolved' if state.allocation_success else 'arrived'
 
             # log allocation
             log = Logs(case_id=case.id, agent_name='resource_allocation_node', message=f"Allocation: success={state.allocation_success}", metadata=state.allocation_reasoning)
             db.session.add(log)
             db.session.commit()
 
-            state.workflow_status = 'resources_allocated' if state.allocation_success else 'allocation_partial'
+            state.workflow_status = 'resolved' if state.allocation_success else 'arrived'
+            state.case_status = case.status
+
+            self._log_state_snapshot(state, "allocation")
             return state
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
+            self._log_state_snapshot(state, "allocation_error")  # Issue #11: Log error state
             return state
 
     def alert_node(self, state: EmergencyState) -> EmergencyState:
@@ -218,15 +369,19 @@ class EmergencyDispatchGraph:
             state.alerts_count = alert_result.get('count', len(state.alerts_sent))
             state.llm_priority = alert_result.get('llm_priority') or alert_result.get('priority')
 
+            case.status = 'alerts_sent'
+
             log = Logs(case_id=case.id, agent_name='alert_node', message=f"Alerts sent: {state.alerts_count}", metadata=str(state.llm_priority))
             db.session.add(log)
             db.session.commit()
 
             state.workflow_status = 'alerts_sent'
+            state.case_status = case.status
             return state
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
+            self._log_state_snapshot(state, "alert_error")  # Issue #11: Log error state
             return state
 
     def chat_node(self, state: EmergencyState) -> EmergencyState:
@@ -235,7 +390,13 @@ class EmergencyDispatchGraph:
                 state.error_message = 'No user message for chat node'
                 return state
 
-            chat_result = self.chat_agent.chat(state.user_message, state.user_id)
+            chat_result = self.chat_agent.chat(
+                state.user_message,
+                user_id=state.user_id,
+                user_role=state.user_role,
+                hospital_user_id=state.hospital_user_id,
+                ambulance_user_id=state.ambulance_user_id,
+            )
             state.chat_intent = chat_result.get('intent')
             state.chat_response = chat_result.get('response')
             if state.case_id:
@@ -247,21 +408,32 @@ class EmergencyDispatchGraph:
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
+            self._log_state_snapshot(state, "chat_error")  # Issue #11: Log error state
             return state
 
     def finalise_node(self, state: EmergencyState) -> EmergencyState:
         try:
-            state.workflow_status = 'completed'
+            if state.error_message or state.workflow_status != 'alerts_sent':
+                state.workflow_status = 'failed'
+                final_case_status = 'failed_escalation'  
+            else:
+                state.workflow_status = 'discharged'
+                final_case_status = 'discharged' 
+            
             if state.case_id:
                 case = Case.query.get(state.case_id)
                 if case:
                     case.eta = state.eta or case.eta
+                    case.status = final_case_status  
                     db.session.add(case)
                     db.session.commit()
+                    state.case_status = case.status
+            self._log_state_snapshot(state, "finalise")  # Log final state
             return state
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
+            self._log_state_snapshot(state, "finalise_error")  # Issue #11: Log error state
             return state
 
 

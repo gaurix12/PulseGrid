@@ -5,7 +5,10 @@ SQLAlchemy
 Flask-SocketIO
 eventlet
 langchain
+langchain-groq
 langgraph
 requests
 python-dotenv
 pydantic
+groq
+flask-socketio

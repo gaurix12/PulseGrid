@@ -1,5 +1,6 @@
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint, event, validates
+from datetime import datetime
 
 db = SQLAlchemy()
 
@@ -51,11 +52,25 @@ class Ambulance(db.Model):
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     current_latitude = db.Column(db.Float, nullable=True)
     current_longitude = db.Column(db.Float, nullable=True)
-
+    __table_args__ = (
+        UniqueConstraint('current_case_id', name='unique_current_case'),
+    )
     def __repr__(self):
         return f'<Ambulance {self.id}>'
 
 class Case(db.Model):
+    # Issue #22: Define valid status transitions
+    VALID_STATUSES = {
+        "created",           # Initial state
+        "triaged",          # After triage assessment
+        "dispatched",       # After ambulance dispatch
+        "arrived",          # After hospital selection/arrived
+        "resolved",         # After resource allocation
+        "alerts_sent",      # After alerts sent
+        "discharged",       # Final success state
+        "failed_escalation", # Final failure state
+    }
+    
     id = db.Column(db.Integer, primary_key=True)
     patient_name = db.Column(db.String(120), nullable=False)
     condition = db.Column(db.String(200), nullable=False)
@@ -66,6 +81,7 @@ class Case(db.Model):
     eta = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     delay = db.Column(db.Boolean, default=False)
+    status = db.Column(db.String(20), nullable=False, default='created')  
 
     __table_args__ = (
         CheckConstraint("severity IN ('P0', 'P1', 'P2', 'P3')", name='check_case_severity'),
@@ -74,12 +90,19 @@ class Case(db.Model):
     ambulance = db.relationship('Ambulance', foreign_keys=[ambulance_id], lazy='joined')
     hospital = db.relationship('Hospital', foreign_keys=[hospital_id], lazy='joined')
 
+    @validates('status')
+    def validate_status(self, key, status):
+        """Issue #22: Enforce valid status transitions via validator"""
+        if status not in self.VALID_STATUSES:
+            raise ValueError(f"Invalid case status: {status}. Must be one of {self.VALID_STATUSES}")
+        return status
+
     def __repr__(self):
         return f'<Case {self.id} ({self.patient_name})>'
 
 class Logs(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    case_id = db.Column(db.Integer, db.ForeignKey('case.id'), nullable=False)
+    case_id = db.Column(db.Integer, db.ForeignKey('case.id'), nullable=True)
     agent_name = db.Column(db.String(120), nullable=False)
     message = db.Column(db.Text, nullable=False)
     metadata = db.Column(db.Text, nullable=True)
@@ -102,12 +125,13 @@ class Resource(db.Model):
 
 class Reserved(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    case_id = db.Column(db.Integer, db.ForeignKey('case.id'), nullable=False)
+    case_id = db.Column(db.Integer, db.ForeignKey('case.id', ondelete='CASCADE'), nullable=False)
     hospital_id = db.Column(db.Integer, db.ForeignKey('hospital.id'), nullable=False)
     type = db.Column(db.String(50), nullable=False)  # 'icu', 'ventilator', 'bed'
     quantity = db.Column(db.Integer, nullable=False)  # how many ICU beds, etc.
     status = db.Column(db.String(20), nullable=False)  # 'reserved', 'confirmed', 'cancelled'
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+
 
     def __repr__(self):
         return f'<Reserved case={self.case_id} hospital={self.hospital_id} type={self.type}>'

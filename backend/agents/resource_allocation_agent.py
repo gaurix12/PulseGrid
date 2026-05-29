@@ -48,47 +48,77 @@ Your task:
                 "reserved": []
             }
 
-        severity_level = case.severity
-        resource_needs = self._get_resource_needs(severity_level, case.condition)
+        if not getattr(case, "severity", None):
+            return {
+                "success": False,
+                "reason": "Case severity is missing. Triaging must complete before resource allocation.",
+                "reserved": []
+            }
 
-        available_resources = Resource.query.filter_by(
-            hospital_id=hospital.id,
-            status='available'
-        ).all()
+        try:
+            severity_level = case.severity
+            resource_needs = self._get_resource_needs(severity_level, case.condition)
 
-        resource_needs_str = "\n".join(
-            [f"- {need['quantity']} {need['type']}" for need in resource_needs]
-        )
-        available_resources_str = "\n".join(
-            [f"- {r.resource_type}: {r.available} available" for r in available_resources]
-        ) if available_resources else "No resources listed"
+            available_resources = Resource.query.filter_by(
+                hospital_id=hospital.id,
+                status='available'
+            ).all()
 
-        llm_decision = None
-        if self.llm:
-            try:
-                llm_input = self.prompt.format(
-                    severity_level=severity_level,
-                    condition=case.condition,
-                    available_resources=available_resources_str,
-                    resource_needs=resource_needs_str,
-                    hospital_name=hospital.name
+            resource_needs_str = "\n".join(
+                [f"- {need['quantity']} {need['type']}" for need in resource_needs]
+            )
+            available_resources_str = "\n".join(
+                [f"- {r.resource_type}: {r.available} available" for r in available_resources]
+            ) if available_resources else "No resources listed"
+
+            llm_decision = None
+            if self.llm:
+                try:
+                    llm_input = self.prompt.format(
+                        severity_level=severity_level,
+                        condition=case.condition,
+                        available_resources=available_resources_str,
+                        resource_needs=resource_needs_str,
+                        hospital_name=hospital.name
+                    )
+                    llm_output = self.llm.invoke(llm_input)
+                    llm_decision = self.output_parser.parse(llm_output.content)
+                except Exception:
+                    llm_decision = None
+
+            if llm_decision:
+                result = self._execute_llm_allocation(
+                    case, hospital, llm_decision, available_resources, severity_level
                 )
-                llm_output = self.llm.invoke(llm_input)
-                llm_decision = self.output_parser.parse(llm_output.content)
-            except Exception as e:
-                llm_decision = None
+            else:
+                result = self._execute_deterministic_allocation(
+                    case, hospital, resource_needs, available_resources, severity_level
+                )
 
-        if llm_decision:
-            result = self._execute_llm_allocation(
-                case, hospital, llm_decision, available_resources, severity_level
-            )
-        else:
-            result = self._execute_deterministic_allocation(
-                case, hospital, resource_needs, available_resources, severity_level
-            )
+            if result.get("failed"):
+                db.session.rollback()
+                return {
+                    "success": False,
+                    "severity_level": severity_level,
+                    "allocated": [],
+                    "failed": result.get("failed", []),
+                    "case_id": case.id,
+                    "hospital_id": hospital.id,
+                    "reasoning": result.get("reasoning", "Allocation failed"),
+                    "alternative_strategy": result.get("alternative_strategy"),
+                    "escalation_needed": result.get("escalation_needed", False),
+                    "note": result.get("note"),
+                }
 
-        db.session.commit()
-        return result
+            db.session.commit()
+            return result
+        except Exception as e:
+            db.session.rollback()
+            return {
+                "success": False,
+                "reason": str(e),
+                "reserved": []
+            }
 
     def _execute_llm_allocation(self, case: Case, hospital: Hospital, llm_decision: Dict, 
                                available_resources: List[Resource], severity_level: str) -> Dict[str, Any]:
@@ -117,10 +147,12 @@ Your task:
                     case, hospital, resource_type, quantity_needed
                 )
                 self._decrement_resource_availability(resource, quantity_needed)
+                self._confirm_reservation_record(reserved_record)
                 allocated.append({
                     "resource_type": resource_type,
                     "quantity": quantity_needed,
-                    "reserved_id": reserved_record.id
+                    "reserved_id": reserved_record.id,
+                    "reservation_status": reserved_record.status,
                 })
             else:
                 failed.append({
@@ -172,10 +204,12 @@ Your task:
                     case, hospital, resource_type, quantity_needed
                 )
                 self._decrement_resource_availability(resource, quantity_needed)
+                self._confirm_reservation_record(reserved_record)
                 allocated.append({
                     "resource_type": resource_type,
                     "quantity": quantity_needed,
-                    "reserved_id": reserved_record.id
+                    "reserved_id": reserved_record.id,
+                    "reservation_status": reserved_record.status,
                 })
             else:
                 failed.append({
@@ -238,20 +272,24 @@ Your task:
         }
 
     def confirm_reservation(self, case_id: int) -> Dict[str, Any]:
-        reservations = Reserved.query.filter_by(case_id=case_id, status='reserved').all()
+        try:
+            reservations = Reserved.query.filter_by(case_id=case_id, status='reserved').all()
 
-        if not reservations:
-            return {"success": False, "reason": "No pending reservations"}
+            if not reservations:
+                return {"success": False, "reason": "No pending reservations"}
 
-        for res in reservations:
-            res.status = 'confirmed'
+            for res in reservations:
+                self._confirm_reservation_record(res)
 
-        db.session.commit()
-        return {
-            "success": True,
-            "case_id": case_id,
-            "confirmed_count": len(reservations)
-        }
+            db.session.commit()
+            return {
+                "success": True,
+                "case_id": case_id,
+                "confirmed_count": len(reservations)
+            }
+        except Exception as e:
+            db.session.rollback()
+            return {"success": False, "error": str(e)}
 
     def check_resource_availability(self, hospital: Hospital, needs: List[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
         availability = {}
@@ -325,6 +363,9 @@ Your task:
         )
         db.session.add(reservation)
         return reservation
+
+    def _confirm_reservation_record(self, reservation: Reserved) -> None:
+        reservation.status = 'confirmed'
 
     def _decrement_resource_availability(self, resource: Resource, quantity: int) -> None:
         resource.available -= quantity
