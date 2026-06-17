@@ -1,13 +1,11 @@
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-import json
 
 
 @dataclass
 class EmergencyState:
-    """Issue #25: Add versioning for replayability; ensure JSON-safe serialization"""
-    __version__ = 1  # Schema version for future evolution
+    __version__ = 1  #schema version 
     
     case_id: Optional[int] = None
     case_status: Optional[str] = "created"
@@ -57,7 +55,6 @@ class EmergencyState:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Issue #25: Ensure all fields are JSON-safe (convert datetime to ISO string)"""
         return {
             "__version__": self.__version__,  # Include schema version
             "case_id": self.case_id,
@@ -84,7 +81,7 @@ class EmergencyState:
             "alerts_count": self.alerts_count,
             "llm_priority": self.llm_priority,
             "location": self.location,
-            "created_at": self.created_at.isoformat() if self.created_at else None,  # Convert datetime to ISO string
+            "created_at": self.created_at.isoformat() if self.created_at else None, 
             "eta": self.eta,
             "user_message": self.user_message,
             "user_id": self.user_id,
@@ -101,12 +98,10 @@ class EmergencyState:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EmergencyState":
-        """Issue #25: Deserialize from stored snapshot (supports schema versioning for replay)"""
         version = data.get("__version__", 1)
         if version != cls.__version__:
             raise ValueError(f"Schema version mismatch: {version} != {cls.__version__}")
         
-        # Parse ISO datetime back to datetime object
         created_at = None
         if data.get("created_at") and isinstance(data.get("created_at"), str):
             created_at = datetime.fromisoformat(data["created_at"])

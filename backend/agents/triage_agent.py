@@ -1,7 +1,23 @@
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+try:
+    from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+except Exception:
+    from ..utils.langchain_compat import StructuredOutputParser, ResponseSchema
 from langchain_core.language_models.llms import LLM
 # case-> return severity and condition 
+TRIAGE_GUARDRAILS = """You are a medical triage assistant. Your sole role is to assess symptoms and classify emergency severity levels.
+
+## STRICT RULES:
+1. **Limit classification to P0–P3 scales:**
+   - **P0 (Critical/Life-Threatening):** Cardiac arrest, severe chest pain, not breathing, slurred speech, unconsciousness, severe major accidents.
+   - **P1 (Serious/Stable):** Minor chest pain, breathing difficulty, fractures, deep wounds, seizures, high fever.
+   - **P2 (Moderate):** Vomiting, minor fractures, moderate pain, minor burns.
+   - **P3 (Minor):** Cold, cough, mild pain, bruises, small cuts.
+2. **Never diagnose diseases.** Only label the immediate symptoms as a short condition name (e.g., "respiratory distress", "suspected fracture").
+3. **Be clinical, objective, and fast.**
+4. If patient details are completely empty or nonsensical, default to P3 with condition "Unknown".
+"""
+
 class TriageAgent:
     def __init__(self, llm: LLM):
         self.llm = llm
@@ -13,6 +29,7 @@ class TriageAgent:
         self.prompt = PromptTemplate(
             input_variables=['patient_info', 'format_instructions'],
             template=(
+                TRIAGE_GUARDRAILS+"\n\n"
                 "You are a medical triage assistant.\n\n"
 
                 "Classify the emergency based on symptoms.\n\n"

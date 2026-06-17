@@ -1,5 +1,4 @@
 import json
-
 from ..models import Case,db, Logs, Hospital, Ambulance
 from langgraph.graph import StateGraph, START,END
 from langchain.chat_models import init_chat_model
@@ -66,7 +65,7 @@ class EmergencyDispatchGraph:
             case_id=state.case_id,
             agent_name="workflow_state_snapshot",
             message=f"EmergencyState snapshot after {stage}",
-            metadata=json.dumps({
+            metadata_json=json.dumps({
                 "stage": stage,
                 "workflow_status": state.workflow_status,
                 "case_status": state.case_status,
@@ -117,7 +116,7 @@ class EmergencyDispatchGraph:
                     case_id=new_case.id,
                     agent_name='triage_node',
                     message=f"Case created during triage: severity={state.severity}, condition={state.condition}",
-                    metadata=''
+                    metadata_json=''
                 )
                 db.session.add(log)
                 db.session.commit()
@@ -141,7 +140,7 @@ class EmergencyDispatchGraph:
             return state
         except Exception as e:
             state.error_message = str(e)
-            self._log_state_snapshot(state, "triage_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "triage_error")  
             return state
 
     def create_case_node(self, state: EmergencyState) -> EmergencyState:
@@ -178,7 +177,7 @@ class EmergencyDispatchGraph:
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
-            self._log_state_snapshot(state, "create_case_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "create_case_error")  
             return state
 
     def dispatch_node(self, state: EmergencyState) -> EmergencyState:
@@ -187,7 +186,7 @@ class EmergencyDispatchGraph:
                 state.error_message = 'No case_id present for dispatch'
                 return state
 
-            case = Case.query.with_for_update().get(state.case_id)  # Issue #13: Pessimistic locking
+            case = Case.query.with_for_update().get(state.case_id)  
             if not case:
                 state.error_message = f'Case {state.case_id} not found'
                 return state
@@ -218,7 +217,7 @@ class EmergencyDispatchGraph:
                 case_id=case.id,
                 agent_name='dispatch_node',
                 message=f"Dispatch result: ambulance={amb_id}, hospital={hosp_id}",
-                metadata=str({
+                metadata_json=str({
                     "dispatch_reasoning": dispatch_result.get('reasoning', ''),
                     "assignment_result": assignment_result,
                 }),
@@ -236,7 +235,7 @@ class EmergencyDispatchGraph:
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
-            self._log_state_snapshot(state, "dispatch_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "dispatch_error")  
             return state
 
     def hospital_selection_node(self, state: EmergencyState) -> EmergencyState:
@@ -260,7 +259,7 @@ class EmergencyDispatchGraph:
                     case_id=case.id,
                     agent_name='hospital_selection_node',
                     message=f"Hospital selection skipped: already assigned by dispatch node",
-                    metadata=json.dumps({
+                    metadata_json=json.dumps({
                         "hospital_id": state.hospital_id,
                         "hospital_name": state.hospital_name,
                         "source": "dispatch_node",
@@ -294,7 +293,7 @@ class EmergencyDispatchGraph:
                     case_id=case.id,
                     agent_name='hospital_selection_node',
                     message=f"Hospital selected: {hosp_id}",
-                    metadata=reasoning
+                    metadata_json=reasoning
                 )
                 db.session.add(log)
                 db.session.commit()
@@ -308,7 +307,7 @@ class EmergencyDispatchGraph:
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
-            self._log_state_snapshot(state, "hospital_selection_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "hospital_selection_error")  
             return state
 
     def resource_allocation_node(self, state: EmergencyState) -> EmergencyState:
@@ -337,7 +336,7 @@ class EmergencyDispatchGraph:
             case.status = 'resolved' if state.allocation_success else 'arrived'
 
             # log allocation
-            log = Logs(case_id=case.id, agent_name='resource_allocation_node', message=f"Allocation: success={state.allocation_success}", metadata=state.allocation_reasoning)
+            log = Logs(case_id=case.id, agent_name='resource_allocation_node', message=f"Allocation: success={state.allocation_success}", metadata_json=state.allocation_reasoning)
             db.session.add(log)
             db.session.commit()
 
@@ -349,7 +348,7 @@ class EmergencyDispatchGraph:
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
-            self._log_state_snapshot(state, "allocation_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "allocation_error")  
             return state
 
     def alert_node(self, state: EmergencyState) -> EmergencyState:
@@ -371,7 +370,7 @@ class EmergencyDispatchGraph:
 
             case.status = 'alerts_sent'
 
-            log = Logs(case_id=case.id, agent_name='alert_node', message=f"Alerts sent: {state.alerts_count}", metadata=str(state.llm_priority))
+            log = Logs(case_id=case.id, agent_name='alert_node', message=f"Alerts sent: {state.alerts_count}", metadata_json=str(state.llm_priority))
             db.session.add(log)
             db.session.commit()
 
@@ -381,7 +380,7 @@ class EmergencyDispatchGraph:
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
-            self._log_state_snapshot(state, "alert_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "alert_error") 
             return state
 
     def chat_node(self, state: EmergencyState) -> EmergencyState:
@@ -398,9 +397,29 @@ class EmergencyDispatchGraph:
                 ambulance_user_id=state.ambulance_user_id,
             )
             state.chat_intent = chat_result.get('intent')
-            state.chat_response = chat_result.get('response')
+            state.chat_response = chat_result.get('response', '')
+
+            if not isinstance(state.metadata, dict):
+                state.metadata = {}
+
+            plan = chat_result.get('plan') or {}
+            tool_result = chat_result.get('data') or {}
+            agent_metadata = chat_result.get('metadata') or {}
+
+            state.metadata['plan'] = plan
+            state.metadata['tool_result'] = tool_result
+            state.metadata['tool_used'] = agent_metadata.get('tool_used') or plan.get('tool_name')
+            state.metadata['tool_args'] = agent_metadata.get('tool_args') or plan.get('tool_args')
+            state.metadata['results'] = agent_metadata.get('results') or tool_result
+            state.metadata['reasoning'] = agent_metadata.get('reasoning') or plan.get('reason')
+
             if state.case_id:
-                log = Logs(case_id=state.case_id, agent_name='chat_node', message=state.chat_response, metadata=str(state.chat_intent))
+                log = Logs(
+                    case_id=state.case_id,
+                    agent_name='chat_node',
+                    message=state.chat_response,
+                    metadata_json=str(state.chat_intent),
+                )
                 db.session.add(log)
                 db.session.commit()
 
@@ -408,33 +427,43 @@ class EmergencyDispatchGraph:
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
-            self._log_state_snapshot(state, "chat_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "chat_error")  
             return state
+
 
     def finalise_node(self, state: EmergencyState) -> EmergencyState:
         try:
+
+            is_chat_only = bool(state.chat_response) and state.workflow_status in ('started', '')
+
+            if is_chat_only:
+                state.workflow_status = 'chat_completed'
+                return state
+
             if state.error_message or state.workflow_status != 'alerts_sent':
                 state.workflow_status = 'failed'
-                final_case_status = 'failed_escalation'  
+                final_case_status = 'failed_escalation'
             else:
-                state.workflow_status = 'discharged'
-                final_case_status = 'discharged' 
-            
+                state.workflow_status = 'completed'
+                final_case_status = 'alerts_sent'
+
             if state.case_id:
                 case = Case.query.get(state.case_id)
                 if case:
                     case.eta = state.eta or case.eta
-                    case.status = final_case_status  
+                    case.status = final_case_status
                     db.session.add(case)
                     db.session.commit()
                     state.case_status = case.status
-            self._log_state_snapshot(state, "finalise")  # Log final state
+
+            self._log_state_snapshot(state, "finalise")  
             return state
         except Exception as e:
             db.session.rollback()
             state.error_message = str(e)
-            self._log_state_snapshot(state, "finalise_error")  # Issue #11: Log error state
+            self._log_state_snapshot(state, "finalise_error")  
             return state
+
 
 
 

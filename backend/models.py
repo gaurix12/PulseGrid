@@ -1,5 +1,6 @@
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import CheckConstraint, UniqueConstraint, event, validates
+from sqlalchemy import CheckConstraint, UniqueConstraint, event
+from sqlalchemy.orm import validates
 from datetime import datetime
 
 db = SQLAlchemy()
@@ -33,6 +34,8 @@ class Hospital(db.Model):
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     latitude = db.Column(db.Float, nullable=True)
     longitude = db.Column(db.Float, nullable=True)
+    phone_number = db.Column(db.String(30), nullable=True)
+    contact_email = db.Column(db.String(120), nullable=True)
 
     __table_args__ = (
         CheckConstraint('current_patients <= capacity', name='check_capacity'),
@@ -43,6 +46,28 @@ class Hospital(db.Model):
 
     def __repr__(self):
         return f'<Hospital {self.name}>'
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'location': self.location,
+            'capacity': self.capacity,
+            'current_patients': self.current_patients,
+            'beds_total': self.beds_total,
+            'beds_available': self.beds_available,
+            'icu_total': self.icu_total,
+            'icu_available': self.icu_available,
+            'ventilators_total': self.ventilators_total,
+            'ventilators_available': self.ventilators_available,
+            'has_cardiology': self.has_cardiology,
+            'has_trauma_care': self.has_trauma_care,
+            'latitude': self.latitude,
+            'longitude': self.longitude,
+            'phone_number': self.phone_number,
+            'contact_email': self.contact_email,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
 
 class Ambulance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -55,11 +80,23 @@ class Ambulance(db.Model):
     __table_args__ = (
         UniqueConstraint('current_case_id', name='unique_current_case'),
     )
+
     def __repr__(self):
         return f'<Ambulance {self.id}>'
 
+    def to_dict(self):
+        """Canonical serialization used by GET /ambulances."""
+        return {
+            'id': self.id,
+            'driver_name': self.driver_name,
+            'status': self.status,
+            'current_case_id': self.current_case_id,
+            'current_latitude': self.current_latitude,
+            'current_longitude': self.current_longitude,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
 class Case(db.Model):
-    # Issue #22: Define valid status transitions
     VALID_STATUSES = {
         "created",           # Initial state
         "triaged",          # After triage assessment
@@ -92,24 +129,60 @@ class Case(db.Model):
 
     @validates('status')
     def validate_status(self, key, status):
-        """Issue #22: Enforce valid status transitions via validator"""
+        """Enforce valid status transitions via FSM validator."""
         if status not in self.VALID_STATUSES:
             raise ValueError(f"Invalid case status: {status}. Must be one of {self.VALID_STATUSES}")
+        
+        # Enforce FSM transition rules
+        old_status = getattr(self, 'status', None)
+        if old_status and old_status != status:
+            allowed = {
+                'created': {'triaged', 'dispatched', 'failed_escalation'},
+                'triaged': {'dispatched', 'resolved', 'failed_escalation'},
+                'dispatched': {'arrived', 'resolved', 'failed_escalation'},
+                'arrived': {'resolved', 'failed_escalation'},
+                'resolved': {'discharged', 'failed_escalation', 'alerts_sent'},
+                'alerts_sent': {'discharged', 'resolved', 'failed_escalation', 'arrived'},
+                'discharged': set(), # Terminus states - no outgoing transitions
+                'failed_escalation': {'resolved'}, # Transitions to resolved on successful transfer
+            }
+            allowed_next = allowed.get(old_status, set())
+            if status not in allowed_next:
+                raise ValueError(f"Invalid status transition from '{old_status}' to '{status}'")
+
         return status
 
     def __repr__(self):
         return f'<Case {self.id} ({self.patient_name})>'
+
+    def to_dict(self):
+        """Canonical serialization for case status updates."""
+        return {
+            'id': self.id,
+            'patient_name': self.patient_name,
+            'condition': self.condition,
+            'severity': self.severity,
+            'location': self.location,
+            'ambulance_id': self.ambulance_id,
+            'hospital_id': self.hospital_id,
+            'status': self.status,
+            'eta': self.eta,
+            'delay': self.delay,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
 
 class Logs(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     case_id = db.Column(db.Integer, db.ForeignKey('case.id'), nullable=True)
     agent_name = db.Column(db.String(120), nullable=False)
     message = db.Column(db.Text, nullable=False)
-    metadata = db.Column(db.Text, nullable=True)
+    # Column is named 'log_metadata' in the existing SQLite DB
+    metadata_json = db.Column('log_metadata', db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
 
     def __repr__(self):
         return f'<Log {self.id} (case={self.case_id}, agent={self.agent_name})>'
+
     
 class Resource(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -119,6 +192,11 @@ class Resource(db.Model):
     available = db.Column(db.Integer, nullable=False)  # tracks how many are unallocated
     status = db.Column(db.String(20), nullable=False)  # 'available', 'in_use', 'maintenance'
     last_updated = db.Column(db.DateTime, default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
+
+    __table_args__ = (
+        CheckConstraint('available >= 0', name='check_resource_available'),
+        CheckConstraint('available <= total', name='check_resource_total'),
+    )
 
     def __repr__(self):
         return f'<Resource {self.id} ({self.resource_type})>'

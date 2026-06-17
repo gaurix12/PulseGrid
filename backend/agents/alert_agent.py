@@ -1,5 +1,5 @@
 """
-Alert routing rules:
+alert routing rules:
 - P0 (Critical): Alert hospital staff + ambulance crew + admins
 - P1 (High): Alert hospital staff + ambulance crew
 - P2 (Medium): Alert ambulance crew only
@@ -8,9 +8,21 @@ Alert routing rules:
 
 from typing import Any, Dict, List
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+try:
+    from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+except Exception:
+    from ..utils.langchain_compat import StructuredOutputParser, ResponseSchema
 from ..models import User, Case, Ambulance, Hospital, Logs, db
 
+ALERT_GUARDRAILS = """You are an emergency alert routing system. Compose concise, actionable messages for the relevant recipients.
+
+## STRICT RULES:
+1. **P0 Severity:** Must alert hospital staff + ambulance crew + system administrators.
+2. **P1 Severity:** Must alert hospital staff + ambulance crew.
+3. **P2 Severity:** Alert ambulance crew only.
+4. **P3 Severity:** Log only. Do not send notifications.
+5. **No Hallucinated Messages:** Only reference details provided in the variables (case_id, severity, condition, location).
+"""
 
 class AlertAgent:
     def __init__(self, llm: Any = None):
@@ -26,7 +38,8 @@ class AlertAgent:
         
         self.prompt = PromptTemplate(
             input_variables=['case_id', 'severity', 'condition', 'location', 'ambulance_name', 'hospital_name', 'resource_status'],
-            template="""You are an emergency alert routing system for a medical dispatch platform.
+            template=ALERT_GUARDRAILS+"\n\n"+
+                """You are an emergency alert routing system for a medical dispatch platform.
 
 Case ID: {case_id}
 Severity Level: {severity}
@@ -48,7 +61,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
         )
 
     def send_alerts(self, case: Case) -> Dict[str, Any]:
-        """Route and send alerts based on case severity and status."""
         if not case:
             return {
                 "success": False,
@@ -56,7 +68,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
                 "alerts_sent": []
             }
 
-        # Determine alert recipients based on severity
         severity_level = case.severity
         alerts_to_send = self._determine_alert_recipients(severity_level)
 
@@ -67,12 +78,10 @@ Determine who needs to be alerted and compose concise, actionable alert messages
                 "alerts_sent": []
             }
 
-        # Get case context for LLM
         ambulance_name = f"Ambulance {case.ambulance.id}" if case.ambulance else "Unknown"
         hospital_name = case.hospital.name if case.hospital else "TBD"
         resource_status = self._get_resource_status(case)
 
-        # Get LLM decision on alert messaging if available
         llm_decision = None
         if self.llm:
             try:
@@ -143,7 +152,7 @@ Determine who needs to be alerted and compose concise, actionable alert messages
             case_id=case.id,
             agent_name='alert_agent',
             message=f"LLM-based alerts sent to {len(sent_alerts)} users",
-            metadata=f"Priority: {llm_decision.get('priority', 'medium')}, Escalation: {llm_decision.get('requires_escalation', False)}"
+            metadata_json=f"Priority: {llm_decision.get('priority', 'medium')}, Escalation: {llm_decision.get('requires_escalation', False)}"
         )
         db.session.add(log)
 
@@ -159,7 +168,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
         }
 
     def _execute_deterministic_alerts(self, case: Case, recipient_types: List[str]) -> Dict[str, Any]:
-        """Execute alerts using deterministic rule-based messages."""
         sent_alerts = []
 
         for recipient_type in recipient_types:
@@ -193,7 +201,6 @@ Determine who needs to be alerted and compose concise, actionable alert messages
                     })
 
             elif recipient_type == 'admin':
-                # Alert all admins
                 admins = User.query.filter_by(role='admin').all()
                 message = self._generate_admin_message(case)
                 for admin in admins:
@@ -208,7 +215,7 @@ Determine who needs to be alerted and compose concise, actionable alert messages
             case_id=case.id,
             agent_name='alert_agent',
             message=f"Deterministic alerts sent to {len(sent_alerts)} users",
-            metadata=f"Severity: {case.severity}"
+            metadata_json=f"Severity: {case.severity}"
         )
         db.session.add(log)
 

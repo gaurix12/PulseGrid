@@ -6,7 +6,7 @@ from math import asin, cos, radians, sin, sqrt
 from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.tools import tool
 from sqlalchemy import func
-from ..models import Ambulance, Case, Hospital, Logs, Reserved, db
+from ..models import Ambulance, Case, Hospital, Logs, Reserved, Resource, db
 
 
 READ_ONLY_TOOLS = {
@@ -19,14 +19,29 @@ READ_ONLY_TOOLS = {
     "recommend_ambulance_for_case",
 }
 
+ALL_TOOLS = READ_ONLY_TOOLS | {
+    "update_hospital_resources",
+    "reserve_resources",
+    "confirm_reservation",
+    "release_resources",
+    "update_ambulance_status",
+    "update_ambulance_location",
+    "assign_ambulance_to_case",
+    "log_decision",
+    "update_case_status",
+    "update_case_data",
+}
+
 ROLE_TOOL_ALLOWLIST = {
-    "admin": set(),
+    "admin": ALL_TOOLS,
     "hospital": READ_ONLY_TOOLS | {
         "update_hospital_resources",
         "reserve_resources",
         "confirm_reservation",
         "release_resources",
         "log_decision",
+        "update_case_status",
+        "update_case_data",
     },
     "ambulance": READ_ONLY_TOOLS | {
         "update_ambulance_status",
@@ -135,7 +150,7 @@ def _write_tool_audit_log(
         case_id=case_id,
         agent_name=f"tool:{tool_name}",
         message=f"{tool_name} executed by user_id={user_id} role={user_role}",
-        metadata=json.dumps(metadata, default=str),
+        metadata_json=json.dumps(metadata, default=str),
     )
     db.session.add(log_entry)
     # NOTE: Commit moved to invoke_tool for transaction atomicity
@@ -191,11 +206,43 @@ def _authorize_tool_call(
     if tool_name not in allowed_tools:
         return {"success": False, "error": f"Role '{role}' is not allowed to call {tool_name}"}
 
-    kwargs = kwargs or {}
-    if role == "hospital" and tool_name in {"update_hospital_resources", "reserve_resources", "confirm_reservation", "release_resources"}:
+    if kwargs is None:
+        kwargs = {}
+
+    # ── Auto-scope read-only tools to the user's own entity ──────────────
+    # When a hospital/ambulance user calls a read tool without specifying
+    # a specific ID, inject their own entity ID so they only see their own data.
+    if role == "hospital" and user_hospital_id is not None:
+        if tool_name in {"fetch_hospital_data", "fetch_resource_snapshot"}:
+            if kwargs.get("hospital_id") is None:
+                kwargs["hospital_id"] = user_hospital_id
+        if tool_name == "fetch_case_data":
+            if kwargs.get("case_id") is None and kwargs.get("hospital_id") is None:
+                kwargs["hospital_id"] = user_hospital_id
+
+    if role == "ambulance" and user_ambulance_id is not None:
+        if tool_name == "fetch_ambulance_data":
+            if kwargs.get("ambulance_id") is None:
+                kwargs["ambulance_id"] = user_ambulance_id
+        if tool_name == "fetch_case_data":
+            if kwargs.get("case_id") is None and kwargs.get("ambulance_id") is None:
+                kwargs["ambulance_id"] = user_ambulance_id
+
+    # ── Mutation ownership checks ────────────────────────────────────────
+    if role == "hospital" and tool_name in {"update_hospital_resources", "reserve_resources"}:
         hospital_id = _safe_int(kwargs.get("hospital_id"))
         if user_hospital_id is not None and hospital_id is not None and user_hospital_id != hospital_id:
             return {"success": False, "error": "Hospital users can only act on their own hospital"}
+
+    # confirm_reservation / release_resources only take case_id, so we must
+    # look up the case's hospital_id to verify ownership.
+    if role == "hospital" and tool_name in {"confirm_reservation", "release_resources", "update_case_status", "update_case_data"}:
+        case_id = _safe_int(kwargs.get("case_id"))
+        if case_id is not None and user_hospital_id is not None:
+            case_obj = Case.query.get(case_id)
+            if case_obj and case_obj.hospital_id != user_hospital_id:
+                return {"success": False, "error": "Hospital users can only act on cases assigned to their hospital"}
+
     if role == "ambulance" and tool_name in {"update_ambulance_status", "update_ambulance_location", "assign_ambulance_to_case"}:
         ambulance_id = _safe_int(kwargs.get("ambulance_id"))
         if user_ambulance_id is not None and ambulance_id is not None and user_ambulance_id != ambulance_id:
@@ -227,6 +274,7 @@ def _hospital_meets_specialty_requirement(hospital: Hospital, condition: Optiona
 
 @tool
 def fetch_hospital_data(hospital_id: Optional[int] = None) -> Dict[str, Any]:
+    """Fetch hospital(s) data from the database."""
     try:
         if hospital_id is not None:
             hospital = Hospital.query.get(hospital_id)
@@ -250,6 +298,7 @@ def fetch_ambulance_data(
     ambulance_id: Optional[int] = None,
     status: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Fetch ambulance(s) data from the database."""
     try:
         if ambulance_id is not None:
             ambulance = Ambulance.query.get(ambulance_id)
@@ -285,6 +334,7 @@ def fetch_case_data(
     ambulance_id: Optional[int] = None,
     period: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Fetch case(s) data from the database."""
     try:
         if case_id is not None:
             case = Case.query.get(case_id)
@@ -328,6 +378,7 @@ def fetch_resource_snapshot(
     hospital_id: Optional[int] = None,
     resource_type: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Build a resource snapshot for hospital(s)."""
     try:
         resource_type = (resource_type or "").strip().lower()
 
@@ -406,33 +457,94 @@ def fetch_resource_snapshot(
 def update_hospital_resources(
     hospital_id: int,
     resource_type: str,
-    quantity_change: int,
+    quantity_change: Optional[int] = None,
+    absolute_value: Optional[int] = None,
+    total_value: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """Update resource counts for a hospital. Supports relative changes, or setting absolute available/total counts."""
     try:
         hospital = Hospital.query.get(hospital_id)
         if not hospital:
             return {"success": False, "error": f"Hospital {hospital_id} not found"}
 
         resource_type = resource_type.strip().lower()
-        quantity_change = int(quantity_change)
 
+        # Normalize resource_type for consistent Resource table lookups
+        canonical_type = resource_type
         if resource_type in {"bed", "beds"}:
-            hospital.beds_available = max(0, (hospital.beds_available or 0) + quantity_change)
-            hospital.beds_total = max(hospital.beds_available, (hospital.beds_total or 0) + max(quantity_change, 0))
+            canonical_type = "bed"
+            if absolute_value is not None:
+                hospital.beds_available = max(0, int(absolute_value))
+            elif quantity_change is not None:
+                hospital.beds_available = max(0, (hospital.beds_available or 0) + int(quantity_change))
+            
+            if total_value is not None:
+                hospital.beds_total = max(hospital.beds_available, int(total_value))
+            else:
+                hospital.beds_total = max(hospital.beds_available, hospital.beds_total or 0)
+
         elif resource_type == "icu":
-            hospital.icu_available = max(0, (hospital.icu_available or 0) + quantity_change)
-            hospital.icu_total = max(hospital.icu_available, (hospital.icu_total or 0) + max(quantity_change, 0))
+            canonical_type = "icu"
+            if absolute_value is not None:
+                hospital.icu_available = max(0, int(absolute_value))
+            elif quantity_change is not None:
+                hospital.icu_available = max(0, (hospital.icu_available or 0) + int(quantity_change))
+            
+            if total_value is not None:
+                hospital.icu_total = max(hospital.icu_available, int(total_value))
+            else:
+                hospital.icu_total = max(hospital.icu_available, hospital.icu_total or 0)
+
         elif resource_type in {"ventilator", "ventilators"}:
-            hospital.ventilators_available = max(0, (hospital.ventilators_available or 0) + quantity_change)
-            hospital.ventilators_total = max(
-                hospital.ventilators_available,
-                (hospital.ventilators_total or 0) + max(quantity_change, 0),
-            )
+            canonical_type = "ventilator"
+            if absolute_value is not None:
+                hospital.ventilators_available = max(0, int(absolute_value))
+            elif quantity_change is not None:
+                hospital.ventilators_available = max(0, (hospital.ventilators_available or 0) + int(quantity_change))
+            
+            if total_value is not None:
+                hospital.ventilators_total = max(hospital.ventilators_available, int(total_value))
+            else:
+                hospital.ventilators_total = max(hospital.ventilators_available, hospital.ventilators_total or 0)
         else:
             return {
                 "success": False,
                 "error": "resource_type must be one of: bed, icu, ventilator",
             }
+
+
+        # Gap 3 FIX: Keep Resource table in sync with Hospital model
+        resource = Resource.query.filter_by(
+            hospital_id=hospital.id,
+            resource_type=canonical_type,
+        ).first()
+        if resource:
+            # Derive available/total from the Hospital model (source of truth after update)
+            if canonical_type == "bed":
+                resource.available = hospital.beds_available
+                resource.total = hospital.beds_total
+            elif canonical_type == "icu":
+                resource.available = hospital.icu_available
+                resource.total = hospital.icu_total
+            elif canonical_type == "ventilator":
+                resource.available = hospital.ventilators_available
+                resource.total = hospital.ventilators_total
+        else:
+            # Create the Resource row if it doesn't exist yet
+            avail = total = 0
+            if canonical_type == "bed":
+                avail, total = hospital.beds_available, hospital.beds_total
+            elif canonical_type == "icu":
+                avail, total = hospital.icu_available, hospital.icu_total
+            elif canonical_type == "ventilator":
+                avail, total = hospital.ventilators_available, hospital.ventilators_total
+            db.session.add(Resource(
+                hospital_id=hospital.id,
+                resource_type=canonical_type,
+                available=avail,
+                total=total,
+                status="available",
+            ))
 
         db.session.commit()
         return {
@@ -450,6 +562,7 @@ def update_hospital_resources(
 
 @tool
 def update_ambulance_status(ambulance_id: int, status: str) -> Dict[str, Any]:
+    """Update an ambulance's status."""
     try:
         ambulance = Ambulance.query.get(ambulance_id)
         if not ambulance:
@@ -483,6 +596,7 @@ def update_ambulance_location(
     current_latitude: float,
     current_longitude: float,
 ) -> Dict[str, Any]:
+    """Update an ambulance's current GPS location."""
     try:
         ambulance = Ambulance.query.get(ambulance_id)
         if not ambulance:
@@ -504,6 +618,7 @@ def update_ambulance_location(
 
 @tool
 def assign_ambulance_to_case(ambulance_id: int, case_id: int) -> Dict[str, Any]:
+    """Assign an ambulance to a case and synchronize previous assignments."""
     try:
         ambulance = Ambulance.query.get(ambulance_id)
         if not ambulance:
@@ -567,6 +682,7 @@ def reserve_resources(
     resource_type: str = "bed",
     quantity: int = 1,
 ) -> Dict[str, Any]:
+    """Reserve resources (bed/icu/ventilator) for a case at a hospital."""
     try:
         case = Case.query.get(case_id)
         hospital = Hospital.query.get(hospital_id)
@@ -600,6 +716,7 @@ def reserve_resources(
 
 @tool
 def confirm_reservation(case_id: int) -> Dict[str, Any]:
+    """Confirm any pending reservations for a case."""
     try:
         reservations = Reserved.query.filter_by(case_id=case_id, status="reserved").all()
         for reservation in reservations:
@@ -618,16 +735,46 @@ def confirm_reservation(case_id: int) -> Dict[str, Any]:
 
 @tool
 def release_resources(case_id: int) -> Dict[str, Any]:
+    """Release reserved/confirmed resources for a case, restoring availability."""
     try:
-        reservations = Reserved.query.filter_by(case_id=case_id, status="reserved").all()
+        # Release both 'reserved' and 'confirmed' reservations
+        reservations = Reserved.query.filter_by(case_id=case_id).filter(
+            Reserved.status.in_(['reserved', 'confirmed'])
+        ).all()
+
+        released = []
         for reservation in reservations:
-            reservation.status = "released"
+            # Restore availability in the Resource table
+            resource = Resource.query.filter_by(
+                hospital_id=reservation.hospital_id,
+                resource_type=reservation.type,
+            ).first()
+            if resource:
+                resource.available += reservation.quantity
+                # Sync Hospital model fields
+                hospital = Hospital.query.get(reservation.hospital_id)
+                if hospital:
+                    if reservation.type == 'icu':
+                        hospital.icu_available = min(hospital.icu_total, resource.available)
+                    elif reservation.type == 'bed':
+                        hospital.beds_available = min(hospital.beds_total, resource.available)
+                    elif reservation.type == 'ventilator':
+                        hospital.ventilators_available = min(hospital.ventilators_total, resource.available)
+
+            released.append({
+                'resource_type': reservation.type,
+                'quantity': reservation.quantity,
+                'hospital_id': reservation.hospital_id,
+            })
+            reservation.status = 'cancelled'
+
         db.session.commit()
         return {
             "success": True,
             "case_id": case_id,
-            "released_count": len(reservations),
-            "message": f"Released {len(reservations)} reservation(s) for case {case_id}",
+            "released_count": len(released),
+            "released": released,
+            "message": f"Released {len(released)} reservation(s) for case {case_id}",
         }
     except Exception as e:
         db.session.rollback()
@@ -636,6 +783,7 @@ def release_resources(case_id: int) -> Dict[str, Any]:
 
 @tool
 def recommend_hospital_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]:
+    """Recommend suitable hospitals for a case based on resources and specialty."""
     try:
         case = Case.query.get(case_id)
         if not case:
@@ -707,6 +855,7 @@ def recommend_hospital_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]:
 
 @tool
 def explain_hospital_selection(case_id: int, hospital_id: Optional[int] = None) -> Dict[str, Any]:
+    """Provide an explanation for a hospital selection recommendation."""
     try:
         case = Case.query.get(case_id)
         if not case:
@@ -753,6 +902,7 @@ def explain_hospital_selection(case_id: int, hospital_id: Optional[int] = None) 
 
 @tool
 def recommend_ambulance_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]:
+    """Recommend ambulances for a case, ranking by proximity and availability."""
     try:
         case = Case.query.get(case_id)
         if not case:
@@ -797,12 +947,13 @@ def recommend_ambulance_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]
 
 @tool
 def log_decision(case_id: int, agent_name: str, message: str, metadata: Optional[str] = None) -> Dict[str, Any]:
+    """Log a decision or event related to a case."""
     try:
         log = Logs(
             case_id=case_id,
             agent_name=agent_name,
             message=message,
-            metadata=metadata or "",
+            metadata_json=metadata or "",
         )
         db.session.add(log)
         db.session.commit()
@@ -818,7 +969,383 @@ def log_decision(case_id: int, agent_name: str, message: str, metadata: Optional
         return {"success": False, "error": str(e)}
 
 
+def update_case_status(case_id: int, status: str) -> Dict[str, Any]:
+    """Update a case's status.
+    
+    If the status changes to closed ('discharged', 'failed_escalation', 'resolved'), 
+    it will automatically release resources and free the ambulance.
+    """
+    case = Case.query.get(case_id)
+    if not case:
+        return {"success": False, "error": f"Case {case_id} not found"}
+        
+    try:
+        old_status = case.status
+        case.status = status
+        
+        # Resource cleanup if case is closed
+        CLOSED_STATUSES = ('discharged', 'failed_escalation', 'resolved')
+        if status in CLOSED_STATUSES and old_status not in CLOSED_STATUSES:
+            # 1. Reset ambulance
+            if case.ambulance_id:
+                ambulance = Ambulance.query.get(case.ambulance_id)
+                if ambulance and ambulance.status == 'assigned':
+                    ambulance.status = 'idle'
+                    ambulance.current_case_id = None
+            
+            # 2. Release resources
+            reservations = Reserved.query.filter_by(case_id=case.id).filter(
+                Reserved.status != 'cancelled'
+            ).all()
+            for res in reservations:
+                resource = Resource.query.filter_by(
+                    hospital_id=res.hospital_id,
+                    resource_type=res.type
+                ).first()
+                if resource:
+                    resource.available += res.quantity
+                    hosp = Hospital.query.get(res.hospital_id)
+                    if hosp:
+                        if res.type == 'icu':
+                            hosp.icu_available = min(hosp.icu_total, resource.available)
+                        elif res.type == 'bed':
+                            hosp.beds_available = min(hosp.beds_total, resource.available)
+                        elif res.type == 'ventilator':
+                            hosp.ventilators_available = min(hosp.ventilators_total, resource.available)
+                res.status = 'cancelled'
+        
+        db.session.add(case)
+        db.session.commit()
+        return {
+            "success": True,
+            "message": f"Case {case_id} status updated to {status}",
+            "case_id": case_id,
+            "status": status,
+        }
+    except Exception as e:
+        db.session.rollback()
+        return {"success": False, "error": str(e)}
+
+
+def transfer_case_to_another_hospital(case: Case) -> Dict[str, Any]:
+    """Transfers a case from its current hospital to the next best available hospital.
+    
+    Excludes the current hospital from the candidates list.
+    Releases resources at the old hospital and reserves them at the new hospital.
+    """
+    old_hospital_id = case.hospital_id
+    if old_hospital_id is None:
+        return {"success": False, "error": "Case does not have a hospital assigned to transfer from"}
+
+    # 1. Release resources at the old hospital
+    reservations = Reserved.query.filter_by(case_id=case.id, hospital_id=old_hospital_id).filter(
+        Reserved.status.in_(['reserved', 'confirmed'])
+    ).all()
+    for res in reservations:
+        resource = Resource.query.filter_by(
+            hospital_id=old_hospital_id,
+            resource_type=res.type
+        ).first()
+        if resource:
+            resource.available += res.quantity
+            hosp = Hospital.query.get(old_hospital_id)
+            if hosp:
+                if res.type == 'icu':
+                    hosp.icu_available = min(hosp.icu_total, resource.available)
+                elif res.type == 'bed':
+                    hosp.beds_available = min(hosp.beds_total, resource.available)
+                elif res.type == 'ventilator':
+                    hosp.ventilators_available = min(hosp.ventilators_total, resource.available)
+        res.status = 'cancelled'
+
+    # 2. Select the new hospital (excluding the old one)
+    hospitals = Hospital.query.filter(Hospital.id != old_hospital_id).all()
+    if not hospitals:
+        return {"success": False, "error": "No other hospitals available for transfer"}
+
+    required_specialty = _required_specialty_for_condition(case.condition)
+    candidate_hospitals = []
+    for hosp in hospitals:
+        if required_specialty == "cardiology" and not hosp.has_cardiology:
+            continue
+        if required_specialty == "trauma_care" and not hosp.has_trauma_care:
+            continue
+        candidate_hospitals.append(hosp)
+
+    if not candidate_hospitals:
+        return {
+            "success": False,
+            "error": f"No other hospital with required {required_specialty or 'specialty'} is available"
+        }
+
+    suitable_hospitals = []
+    for hosp in candidate_hospitals:
+        lat1, lon1 = _parse_coordinates(case.location)
+        lat2, lon2 = hosp.latitude, hosp.longitude
+        distance = 9999.0
+        if lat1 is not None and lon1 is not None and lat2 is not None and lon2 is not None:
+            distance = _haversine_km(lat1, lon1, lat2, lon2)
+
+        if case.severity in ('P0', 'P1'):
+            if hosp.icu_available > 0 and hosp.beds_available > 0:
+                suitable_hospitals.append((hosp, distance))
+        else:
+            if hosp.beds_available > 0:
+                suitable_hospitals.append((hosp, distance))
+
+    if not suitable_hospitals:
+        for hosp in candidate_hospitals:
+            if hosp.beds_available > 0:
+                lat1, lon1 = _parse_coordinates(case.location)
+                lat2, lon2 = hosp.latitude, hosp.longitude
+                distance = 9999.0
+                if lat1 is not None and lon1 is not None and lat2 is not None and lon2 is not None:
+                    distance = _haversine_km(lat1, lon1, lat2, lon2)
+                suitable_hospitals.append((hosp, distance))
+
+    if not suitable_hospitals:
+        return {"success": False, "error": "No other hospitals have available beds for transfer"}
+
+    suitable_hospitals.sort(key=lambda x: (x[1], -x[0].icu_available, -x[0].beds_available))
+    new_hospital, distance = suitable_hospitals[0]
+
+    # 3. Reserve resources at the new hospital
+    needs = []
+    if case.severity in ('P0', 'P1'):
+        needs.append({'type': 'icu', 'quantity': 1})
+        if 'respiratory' in (case.condition or '').lower() or 'asthma' in (case.condition or '').lower():
+            needs.append({'type': 'ventilator', 'quantity': 1})
+        elif case.severity == 'P0':
+            needs.append({'type': 'ventilator', 'quantity': 1})
+        needs.append({'type': 'bed', 'quantity': 1})
+    else:
+        needs.append({'type': 'bed', 'quantity': 1})
+
+    allocated_resources = []
+    for need in needs:
+        rtype = need['type']
+        qty = need['quantity']
+        res_avail = Resource.query.filter_by(hospital_id=new_hospital.id, resource_type=rtype).first()
+        if res_avail and res_avail.available >= qty:
+            new_res = Reserved(case_id=case.id, hospital_id=new_hospital.id, type=rtype, quantity=qty, status='confirmed')
+            db.session.add(new_res)
+            res_avail.available -= qty
+            if rtype == 'icu':
+                new_hospital.icu_available = res_avail.available
+            elif rtype == 'bed':
+                new_hospital.beds_available = res_avail.available
+            elif rtype == 'ventilator':
+                new_hospital.ventilators_available = res_avail.available
+            allocated_resources.append(f"{qty} {rtype}")
+        else:
+            if rtype == 'icu':
+                bed_res = Resource.query.filter_by(hospital_id=new_hospital.id, resource_type='bed').first()
+                if bed_res and bed_res.available >= qty:
+                    new_res = Reserved(case_id=case.id, hospital_id=new_hospital.id, type='bed', quantity=qty, status='confirmed')
+                    db.session.add(new_res)
+                    bed_res.available -= qty
+                    new_hospital.beds_available = bed_res.available
+                    allocated_resources.append(f"{qty} bed (fallback for icu)")
+
+    case.hospital_id = new_hospital.id
+    case.status = 'resolved'
+
+    transfer_log = Logs(
+        case_id=case.id,
+        agent_name='case_transfer',
+        message=f"Case transferred from hospital {old_hospital_id} to {new_hospital.id} ({new_hospital.name})",
+        metadata_json=json.dumps({
+            "old_hospital_id": old_hospital_id,
+            "new_hospital_id": new_hospital.id,
+            "allocated_resources": allocated_resources,
+            "distance_km": round(distance, 2) if distance != 9999 else None,
+            "timestamp": datetime.utcnow().isoformat()
+        }, default=str)
+    )
+    db.session.add(transfer_log)
+
+    return {
+        "success": True,
+        "message": f"Case transferred to hospital {new_hospital.name} successfully",
+        "hospital_id": new_hospital.id,
+        "hospital_name": new_hospital.name,
+        "status": case.status
+    }
+
+
+@tool
+def update_case_data(
+    case_id: int,
+    status: Optional[str] = None,
+    hospital_id: Optional[int] = None,
+    ambulance_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Update case details including status, hospital_id (transfer), or ambulance_id."""
+    case = Case.query.get(case_id)
+    if not case:
+        return {"success": False, "error": f"Case {case_id} not found"}
+
+    try:
+        changes = []
+        old_status = case.status
+
+        # 1. Update Hospital (Transfer Case)
+        if hospital_id is not None and case.hospital_id != hospital_id:
+            old_hosp_id = case.hospital_id
+            new_hospital = Hospital.query.get(hospital_id)
+            if not new_hospital:
+                return {"success": False, "error": f"Hospital {hospital_id} not found"}
+
+            required_speciality = _required_specialty_for_condition(case.condition)
+            if required_speciality == "cardiology" and not new_hospital.has_cardiology:
+                return {"success": False, "error": f"Hospital {new_hospital.name} does not have cardiology specialty required for this case"}
+            if required_speciality == "trauma_care" and not new_hospital.has_trauma_care:
+                return {"success": False, "error": f"Hospital {new_hospital.name} does not have trauma care specialty required for this case"}
+
+            # Release resources at old hospital
+            if old_hosp_id is not None:
+                reservations = Reserved.query.filter_by(case_id=case.id, hospital_id=old_hosp_id).filter(
+                    Reserved.status.in_(['reserved', 'confirmed'])
+                ).all()
+                for res in reservations:
+                    resource = Resource.query.filter_by(
+                        hospital_id=old_hosp_id,
+                        resource_type=res.type
+                    ).first()
+                    if resource:
+                        resource.available += res.quantity
+                        hosp = Hospital.query.get(old_hosp_id)
+                        if hosp:
+                            if res.type == 'icu':
+                                hosp.icu_available = min(hosp.icu_total, resource.available)
+                            elif res.type == 'bed':
+                                hosp.beds_available = min(hosp.beds_total, resource.available)
+                            elif res.type == 'ventilator':
+                                hosp.ventilators_available = min(hosp.ventilators_total, resource.available)
+                    res.status = 'cancelled'
+
+            # Allocate resources at new hospital
+            needs = []
+            if case.severity in ('P0', 'P1'):
+                needs.append({'type': 'icu', 'quantity': 1})
+                if 'respiratory' in (case.condition or '').lower() or 'asthma' in (case.condition or '').lower():
+                    needs.append({'type': 'ventilator', 'quantity': 1})
+                elif case.severity == 'P0':
+                    needs.append({'type': 'ventilator', 'quantity': 1})
+                needs.append({'type': 'bed', 'quantity': 1})
+            else:
+                needs.append({'type': 'bed', 'quantity': 1})
+
+            for need in needs:
+                rtype = need['type']
+                qty = need['quantity']
+                res_avail = Resource.query.filter_by(hospital_id=hospital_id, resource_type=rtype).first()
+                if res_avail and res_avail.available >= qty:
+                    new_res = Reserved(case_id=case.id, hospital_id=hospital_id, type=rtype, quantity=qty, status='confirmed')
+                    db.session.add(new_res)
+                    res_avail.available -= qty
+                    if rtype == 'icu':
+                        new_hospital.icu_available = res_avail.available
+                    elif rtype == 'bed':
+                        new_hospital.beds_available = res_avail.available
+                    elif rtype == 'ventilator':
+                        new_hospital.ventilators_available = res_avail.available
+                else:
+                    if rtype == 'icu':
+                        bed_res = Resource.query.filter_by(hospital_id=hospital_id, resource_type='bed').first()
+                        if bed_res and bed_res.available >= qty:
+                            new_res = Reserved(case_id=case.id, hospital_id=hospital_id, type='bed', quantity=qty, status='confirmed')
+                            db.session.add(new_res)
+                            bed_res.available -= qty
+                            new_hospital.beds_available = bed_res.available
+                        else:
+                            return {"success": False, "error": f"Hospital {new_hospital.name} does not have sufficient beds/ICU resources available"}
+                    elif rtype == 'ventilator':
+                        if case.severity == 'P0' or 'respiratory' in (case.condition or '').lower():
+                            return {"success": False, "error": f"Hospital {new_hospital.name} does not have sufficient ventilator resources available"}
+                    else:
+                        return {"success": False, "error": f"Hospital {new_hospital.name} does not have sufficient {rtype} resources available"}
+
+            case.hospital_id = hospital_id
+            changes.append(f"hospital changed from {old_hosp_id} to {hospital_id}")
+
+            if case.status == 'failed_escalation':
+                case.status = 'resolved'
+                changes.append("status changed from failed_escalation to resolved")
+
+            log = Logs(
+                case_id=case.id,
+                agent_name='update_case_data',
+                message=f"Hospital assignment changed from {old_hosp_id} to {hospital_id}",
+                metadata_json=json.dumps({
+                    "old_hospital_id": old_hosp_id,
+                    "new_hospital_id": hospital_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }, default=str)
+            )
+            db.session.add(log)
+
+        # 2. Update Ambulance assignment
+        if ambulance_id is not None and case.ambulance_id != ambulance_id:
+            assign_res = assign_ambulance_to_case.__wrapped__(ambulance_id=ambulance_id, case_id=case.id)
+            if not assign_res.get('success'):
+                return assign_res
+            changes.append(f"ambulance assigned to {ambulance_id}")
+
+        # 3. Update Status
+        if status is not None and case.status != status:
+            case.status = status
+            changes.append(f"status updated to {status}")
+
+            CLOSED_STATUSES = ('discharged', 'failed_escalation', 'resolved')
+            if status in CLOSED_STATUSES and old_status not in CLOSED_STATUSES:
+                if case.ambulance_id:
+                    ambulance = Ambulance.query.get(case.ambulance_id)
+                    if ambulance and ambulance.status == 'assigned':
+                        ambulance.status = 'idle'
+                        ambulance.current_case_id = None
+
+                reservations = Reserved.query.filter_by(case_id=case.id).filter(
+                    Reserved.status != 'cancelled'
+                ).all()
+                for res in reservations:
+                    resource = Resource.query.filter_by(
+                        hospital_id=res.hospital_id,
+                        resource_type=res.type
+                    ).first()
+                    if resource:
+                        resource.available += res.quantity
+                        hosp = Hospital.query.get(res.hospital_id)
+                        if hosp:
+                            if res.type == 'icu':
+                                hosp.icu_available = min(hosp.icu_total, resource.available)
+                            elif res.type == 'bed':
+                                hosp.beds_available = min(hosp.beds_total, resource.available)
+                            elif res.type == 'ventilator':
+                                hosp.ventilators_available = min(hosp.ventilators_total, resource.available)
+                    res.status = 'cancelled'
+
+        if not changes:
+            return {"success": True, "message": "No changes requested for case", "case_id": case.id}
+
+        db.session.add(case)
+        db.session.commit()
+        return {
+            "success": True,
+            "message": f"Case {case.id} updated successfully: {', '.join(changes)}",
+            "case_id": case.id,
+            "status": case.status,
+            "hospital_id": case.hospital_id,
+            "ambulance_id": case.ambulance_id,
+        }
+    except Exception as e:
+        db.session.rollback()
+        return {"success": False, "error": str(e)}
+
+
 TOOL_REGISTRY = {
+    "update_case_status": update_case_status,
+    "update_case_data": update_case_data,  # Map to new robust case data update tool
     "fetch_hospital_data": fetch_hospital_data,
     "fetch_ambulance_data": fetch_ambulance_data,
     "fetch_case_data": fetch_case_data,
@@ -907,7 +1434,11 @@ def invoke_tool(
     savepoint = db.session.begin_nested()  # Create savepoint for rollback
     try:
         # Execute tool - may commit internally
-        result = tool_obj.invoke(kwargs)
+        # Handle both @tool-decorated functions (.invoke) and plain functions
+        if hasattr(tool_obj, 'invoke'):
+            result = tool_obj.invoke(kwargs)
+        else:
+            result = tool_obj(**kwargs)
         
         # Write audit log for this tool execution
         try:

@@ -12,15 +12,16 @@ def register():
     email = data.get('email')
     password = data.get('password')
     role = data.get('role')
-    hospital_id = data.get('hospital_id')
-    ambulance_id = data.get('ambulance_id')
 
     if not username or not email or not password or not role:
         return jsonify({"message": "username, email, password, and role are required"}), 400
 
-    allowed_roles = {'hospital', 'ambulance', 'admin'}
-    if role not in allowed_roles:
-        return jsonify({"message": "role must be one of: hospital, ambulance, admin"}), 400
+    admin_exists = User.query.filter_by(role='admin').first() is not None
+    if role == 'admin':
+        if admin_exists:
+            return jsonify({"message": "Admin account already exists. Contact an existing admin."}), 400
+    elif role not in {'hospital', 'ambulance'}:
+        return jsonify({"message": "role must be one of: hospital, ambulance, admin (first user only)"}), 400
 
     if User.query.filter_by(username=username).first():
         return jsonify({"message": "Username already exists"}), 400
@@ -33,8 +34,8 @@ def register():
         email=email,
         password_hash=generate_password_hash(password),
         role=role,
-        hospital_id=hospital_id,
-        ambulance_id=ambulance_id,
+        hospital_id=None,
+        ambulance_id=None,
     )
     db.session.add(new_user)
     db.session.commit()
@@ -57,6 +58,7 @@ def login():
     username = data.get('username')
     email = data.get('email')
     password = data.get('password')
+    role = data.get('role')
 
     if not password or (not username and not email):
         return jsonify({"message": "Provide password and either username or email"}), 400
@@ -69,11 +71,21 @@ def login():
 
     if not user or not check_password_hash(user.password_hash, password):
         return jsonify({"message": "Invalid credentials"}), 401
+
+    if role and user.role != role:
+        return jsonify({"message": f"This account does not have the '{role}' role"}), 401
     session['user_id'] = user.id
     session['username'] = user.username
-    session['role']=user.role
-    session['hospital_id']=user.hospital_id
-    session['ambulance_id']=user.ambulance_id
+    session['role'] = user.role
+    session['hospital_id'] = user.hospital_id
+    session['ambulance_id'] = user.ambulance_id
+
+    needs_onboarding = False
+    if user.role == 'hospital' and user.hospital_id is None:
+        needs_onboarding = True
+    elif user.role == 'ambulance' and user.ambulance_id is None:
+        needs_onboarding = True
+
     return jsonify({
         "message": "Login successful",
         "user": {
@@ -83,6 +95,7 @@ def login():
             "role": user.role,
             "hospital_id": user.hospital_id,
             "ambulance_id": user.ambulance_id,
+            "needs_onboarding": needs_onboarding,
         },
     }), 200
 

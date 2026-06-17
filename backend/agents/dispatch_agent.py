@@ -1,10 +1,22 @@
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+try:
+    from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+except Exception:
+    from ..utils.langchain_compat import StructuredOutputParser, ResponseSchema
 import math
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any
 from ..models import Ambulance, Case, Hospital, Logs, db
 from ..tools.langchain_tools import recommend_ambulance_for_case, recommend_hospital_for_case
 # case ->ambulance,hospital
+
+DISPATCH_GUARDRAILS = """You are an emergency dispatch system agent. Your role is to select the best ambulance and hospital combination for incoming cases.
+
+## STRICT RULES:
+1. **Nearest Ambulance:** Choose the closest idle ambulance to the patient location.
+2. **Safety First:** Select a hospital with matching capabilities and resource availability matching the patient's triage severity.
+3. **Log Decisions:** Ensure the selected IDs correspond strictly to available units in the parameters. Do not hallucinate IDs.
+"""
+
 class DispatchAgent:
     def __init__(self, llm: Any = None):
         self.llm = llm
@@ -18,6 +30,7 @@ class DispatchAgent:
             input_variables=['patient_name', 'condition', 'severity', 'location', 'ambulances', 'hospitals', 'format_instructions'],
 
             template=(
+                DISPATCH_GUARDRAILS+"\n\n"
                 """
 You are an emergency dispatch system.
 
@@ -82,7 +95,9 @@ Return ONLY valid JSON that matches the format instructions below.
                     "reasoning": "Case severity is missing. Triaging must complete before dispatch.",
                 }
 
+            print(f"[AGENT] Scoring ambulances for case {case.id}...")
             ambulance_recommendation = recommend_ambulance_for_case.invoke({"case_id": case.id, "top_k": 1})
+            print(f"[AGENT] Scoring hospitals for case {case.id}...")
             hospital_recommendation = recommend_hospital_for_case.invoke({"case_id": case.id, "top_k": 1})
 
             ambulance_candidates = ambulance_recommendation.get("recommended", []) if ambulance_recommendation.get("success") else []
@@ -93,6 +108,9 @@ Return ONLY valid JSON that matches the format instructions below.
 
             chosen_ambulance = ambulance_candidates[0]
             chosen_hospital = hospital_candidates[0]
+
+            print(f"[AGENT] Selected Ambulance: ID {chosen_ambulance['ambulance_id']} (score: {chosen_ambulance.get('score')})")
+            print(f"[AGENT] Selected Hospital: {chosen_hospital.get('hospital', f'Hospital {chosen_hospital.get('hospital_id')}')} (score: {chosen_hospital.get('score')})")
 
             result = {
                 "ambulance_id": chosen_ambulance["ambulance_id"],
@@ -109,7 +127,7 @@ Return ONLY valid JSON that matches the format instructions below.
                 case_id=case.id,
                 agent_name='dispatch_agent',
                 message=f"Dispatched ambulance {result.get('ambulance_id')} to hospital {result.get('hospital_id')}",
-                metadata=result.get('reasoning', 'ranking-tool-based dispatch')
+                 metadata_json=result.get('reasoning', 'ranking-tool-based dispatch')
             )
             db.session.add(log)
             db.session.commit()
@@ -138,7 +156,9 @@ Return ONLY valid JSON that matches the format instructions below.
 
     #fallback: simple rules - nearest ambulance, hospital with resources, log reasoning for audit
     def fallback(self, case, location):
+        print(f"[AGENT] [Fallback] Scoring ambulances for case {case.id}...")
         ambulance_recommendation = recommend_ambulance_for_case.invoke({"case_id": case.id, "top_k": 1})
+        print(f"[AGENT] [Fallback] Scoring hospitals for case {case.id}...")
         hospital_recommendation = recommend_hospital_for_case.invoke({"case_id": case.id, "top_k": 1})
 
         ambulance_candidates = ambulance_recommendation.get("recommended", []) if ambulance_recommendation.get("success") else []
@@ -149,6 +169,9 @@ Return ONLY valid JSON that matches the format instructions below.
 
         chosen_ambulance = ambulance_candidates[0]
         chosen_hospital = hospital_candidates[0]
+
+        print(f"[AGENT] [Fallback] Selected Ambulance: ID {chosen_ambulance['ambulance_id']} (score: {chosen_ambulance.get('score')})")
+        print(f"[AGENT] [Fallback] Selected Hospital: {chosen_hospital.get('hospital', f'Hospital {chosen_hospital.get('hospital_id')}')} (score: {chosen_hospital.get('score')})")
 
         reasoning_parts = [
             f"Ambulance ranking selected {chosen_ambulance['ambulance_id']} with score {chosen_ambulance.get('score')}",
@@ -166,7 +189,7 @@ Return ONLY valid JSON that matches the format instructions below.
             case_id=case.id,
             agent_name='dispatch_agent',
             message=f"Fallback dispatch used ranking tools: ambulance {chosen_ambulance['ambulance_id']} to hospital {chosen_hospital['hospital_id']}",
-            metadata=reasoning
+              metadata_json=reasoning
         )
         db.session.add(log)
         db.session.commit()

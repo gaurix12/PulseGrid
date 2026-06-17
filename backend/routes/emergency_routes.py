@@ -1,6 +1,5 @@
-from flask import Blueprint, jsonify, request
-
-from ..models import Case, User, db
+from flask import Blueprint, jsonify, request, session
+from ..models import Ambulance, Case, Reserved, Resource, Hospital, User, db
 from ..langgraph.graph import EmergencyDispatchGraph
 from ..langgraph.state import EmergencyState
 emergency = Blueprint('emergency', __name__)
@@ -8,24 +7,25 @@ emergency = Blueprint('emergency', __name__)
 @emergency.route('/dispatch', methods=['POST'])
 @emergency.route('', methods=['POST'])
 def emergency_flow():
+    session_role = session.get('role')
+    if not session_role:
+        return jsonify({"success": False, "message": "Authentication required"}), 401
+
     data = request.get_json(silent=True) or {}
     case_id = data.get('case_id')
     message = data.get('message')
     location = data.get('location')
-    user_id = data.get('user_id')
     metadata = data.get('metadata')
     patient_name = data.get('patient_name')
-    user_role = data.get('user_role')
-    hospital_user_id = data.get('hospital_user_id')
-    ambulance_user_id = data.get('ambulance_user_id')
+
+    user_id = session.get('user_id')
+    user_role = session_role
+    hospital_user_id = session.get('hospital_id')
+    ambulance_user_id = session.get('ambulance_id')
 
     user = None
     if user_id is not None:
         user = User.query.get(user_id)
-        if user:
-            user_role = user.role
-            hospital_user_id = user.hospital_id
-            ambulance_user_id = user.ambulance_id
 
     existing_case = None
     if case_id is not None:
@@ -56,28 +56,49 @@ def emergency_flow():
         metadata=metadata if isinstance(metadata, dict) else {"value": metadata},
     )
     
-    # Issue #12: Wrap workflow in transaction boundary with rollback on error
     try:
         res = compiled_graph.invoke(initial_state)
         response_data = res.to_dict() if hasattr(res, 'to_dict') else res
         error_message = response_data.get("error_message")
         
-        # Check if workflow failed; if so, rollback
+        # Check if workflow failed; if so, cleanup resources
         if error_message:
             db.session.rollback()
             final_case = Case.query.get(response_data.get("case_id")) if response_data.get("case_id") else existing_case
+
+            # Cleanup: reset ambulance and release resources on failure
+            if final_case:
+                if final_case.ambulance_id:
+                    amb = Ambulance.query.get(final_case.ambulance_id)
+                    if amb and amb.status == 'assigned':
+                        amb.status = 'idle'
+                        amb.current_case_id = None
+                reservations = Reserved.query.filter_by(case_id=final_case.id).filter(
+                    Reserved.status != 'cancelled'
+                ).all()
+                for r in reservations:
+                    res = Resource.query.filter_by(hospital_id=r.hospital_id, resource_type=r.type).first()
+                    if res:
+                        res.available += r.quantity
+                        hosp = Hospital.query.get(r.hospital_id)
+                        if hosp:
+                            if r.type == 'icu': hosp.icu_available = min(hosp.icu_total, res.available)
+                            elif r.type == 'bed': hosp.beds_available = min(hosp.beds_total, res.available)
+                            elif r.type == 'ventilator': hosp.ventilators_available = min(hosp.ventilators_total, res.available)
+                    r.status = 'cancelled'
+                db.session.commit()
+
             return jsonify({
                 "success": False,
-                "message": "Emergency workflow failed",
+                "message": "Emergency workflow completed with issues",
                 "case_id": response_data.get("case_id"),
                 "case_status": final_case.status if final_case else None,
                 "workflow_status": response_data.get("workflow_status"),
                 "chat_response": response_data.get("chat_response", ""),
                 "error_message": error_message,
                 "data": response_data,
-            }), 500
+            }), 200
         
-        # Commit the transaction on success
         db.session.commit()
         final_case = Case.query.get(response_data.get("case_id")) if response_data.get("case_id") else existing_case
         return jsonify({

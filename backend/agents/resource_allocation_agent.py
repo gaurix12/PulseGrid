@@ -1,9 +1,20 @@
 from typing import Any, Dict, List, Tuple
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+try:
+    from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+except Exception:
+    from ..utils.langchain_compat import StructuredOutputParser, ResponseSchema
 from ..models import Case, Hospital, Reserved, Resource, Logs, db
 
 # severity->calc needs->check availability->reserve->confirm with hospital->release after case closed
+RESOURCE_ALLOCATION_GUARDRAILS = """You are an emergency resource allocation agent. Your role is to allocate hospital resources optimally.
+
+## STRICT RULES:
+1. **Never double-allocate or exceed capacity.**
+2. **P0/P1 Priority:** Prioritize ICU beds and ventilators for P0/P1 cases. If unavailable, recommend an alternative (downgrade to general bed or recommend immediate transfer/escalation).
+3. **Accurate Counts:** Only allocate resources that are confirmed available in the provided inventory list.
+"""
+
 class ResourceAllocationAgent:
     def __init__(self, llm: Any = None):
         self.llm = llm
@@ -19,7 +30,8 @@ class ResourceAllocationAgent:
         
         self.prompt = PromptTemplate(
             input_variables=['severity_level', 'condition', 'available_resources', 'resource_needs', 'hospital_name'],
-            template="""You are an expert emergency resource allocation system. Allocate hospital resources optimally.
+            template=RESOURCE_ALLOCATION_GUARDRAILS+"\n\n"+
+                """You are an expert emergency resource allocation system. Allocate hospital resources optimally.
 
 Case Severity: {severity_level}
 Patient Condition: {condition}
@@ -167,7 +179,7 @@ Your task:
             case_id=case.id,
             agent_name='resource_allocation_agent',
             message=f"LLM-based allocation: {allocated_str if allocated else 'no resources allocated'}",
-            metadata=llm_decision.get('rationale', '')
+            metadata_json=llm_decision.get('rationale', '')
         )
         db.session.add(log)
         
@@ -224,7 +236,7 @@ Your task:
             case_id=case.id,
             agent_name='resource_allocation_agent',
             message=f"Deterministic allocation: {allocated_str if allocated else 'no resources allocated'}",
-            metadata=f"Severity {severity_level}, fallback allocation"
+            metadata_json=f"Severity {severity_level}, fallback allocation"
         )
         db.session.add(log)
 
@@ -255,6 +267,14 @@ Your task:
 
                 if resource:
                     resource.available += res.quantity
+                    hospital = Hospital.query.get(res.hospital_id)
+                    if hospital:
+                        if res.type == 'icu':
+                            hospital.icu_available = min(hospital.icu_total, resource.available)
+                        elif res.type == 'bed':
+                            hospital.beds_available = min(hospital.beds_total, resource.available)
+                        elif res.type == 'ventilator':
+                            hospital.ventilators_available = min(hospital.ventilators_total, resource.available)
                     released.append({
                         "resource_type": res.type,
                         "quantity": res.quantity,
@@ -368,9 +388,26 @@ Your task:
         reservation.status = 'confirmed'
 
     def _decrement_resource_availability(self, resource: Resource, quantity: int) -> None:
-        resource.available -= quantity
-        if resource.available < 0:
-            resource.available = 0
+        # Atomic decrement with availability check to prevent race conditions
+        rows_updated = db.session.query(Resource).filter(
+            Resource.id == resource.id,
+            Resource.available >= quantity
+        ).update(
+            {Resource.available: Resource.available - quantity},
+            synchronize_session='fetch'
+        )
+        if rows_updated == 0:
+            raise ValueError(f"Insufficient availability for resource {resource.resource_type}")
+
+        # Keep Hospital model in sync with Resource table
+        hospital = Hospital.query.get(resource.hospital_id)
+        if hospital:
+            if resource.resource_type == 'icu':
+                hospital.icu_available = resource.available
+            elif resource.resource_type == 'bed':
+                hospital.beds_available = resource.available
+            elif resource.resource_type == 'ventilator':
+                hospital.ventilators_available = resource.available
 
     def _summarize_allocation(self, severity_level: str, allocated: List[Dict], failed: List[Dict]) -> str:
         if not allocated and not failed:

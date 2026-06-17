@@ -1,10 +1,23 @@
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+try:
+    from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
+except Exception:
+    from ..utils.langchain_compat import StructuredOutputParser, ResponseSchema
 from langchain_core.language_models.llms import LLM
 
 from ..models import Hospital, db, Case, Logs
 import math
 
+HOSPITAL_SELECTION_GUARDRAILS = """You are a hospital selection agent. Your role is to match a patient case with the most optimal hospital.
+
+## STRICT RULES:
+1. **Observe Resource Constraints:**
+   - Critical cases (P0/P1) **must** go to a hospital with available ICU beds and ventilators.
+   - Respect specialty requirements (e.g., Cardiology for heart issues, Trauma Center for major accidents).
+2. **Prioritize Proximity:** When resources are equal, select the nearest hospital.
+3. **Never send a patient to a hospital with zero available beds.**
+4. **Never hallucinate resource availability.** Only make recommendations based on the provided list of hospitals.
+"""
 
 def _required_specialty_for_condition(condition: str):
     normalized = str(condition or "").strip().lower()
@@ -26,6 +39,7 @@ class HospitalSelectionAgent:
         self.prompt = PromptTemplate(
             input_variables=["severity", "condition", "hospitals_info", "format_instructions"],
             template=(
+                HOSPITAL_SELECTION_GUARDRAILS+"\n\n"
                 """
 You are a hospital selection agent for emergency medical dispatch.
 
@@ -122,6 +136,7 @@ Return ONLY valid JSON matching the format below:
         return data, required_specialty
 
     def select_hospital(self, case: Case):
+        print(f"[AGENT] Scoring hospitals for case {case.id}...")
         data, required_specialty = self._build_hospital_data(case)
         if not data:
             if required_specialty:
@@ -159,11 +174,15 @@ Return ONLY valid JSON matching the format below:
             if selected_id not in valid_ids:
                 return self.fallback(case, data, required_specialty)
 
+            hosp = Hospital.query.get(selected_id)
+            hosp_name = hosp.name if hosp else f"Hospital {selected_id}"
+            print(f"[AGENT] Selected Hospital: {hosp_name}")
+
             log = Logs(
                 case_id=case.id,
-                agent_name="hospital_selection_agent",
-                message=f"Selected hospital {selected_id}",
-                metadata=result.get("reasoning", "LLM-based selection"),
+                agent_name='hospital_selection_agent',
+                message=f"LLM-based hospital selection: {result.get('selected')}",
+                metadata_json=result.get("reasoning", "LLM-based selection"),
             )
             db.session.add(log)
             db.session.commit()
@@ -193,11 +212,15 @@ Return ONLY valid JSON matching the format below:
         suitable_hospitals.sort(key=lambda x: (x["distance"], -x["icu_available"], -x["ventilators_available"]))
         chosen = suitable_hospitals[0]
 
+        hosp = Hospital.query.get(chosen["hospital_id"])
+        hosp_name = hosp.name if hosp else f"Hospital {chosen['hospital_id']}"
+        print(f"[AGENT] Selected Hospital: {hosp_name} (Fallback)")
+
         log = Logs(
             case_id=case.id,
-            agent_name="hospital_selection_agent",
-            message=f"Fallback: selected hospital {chosen['hospital_id']}",
-            metadata="Based on distance and available resources",
+            agent_name='hospital_selection_agent',
+            message=f"Deterministic selection used for case {case.id}",
+            metadata_json="Based on distance and available resources",
         )
         db.session.add(log)
         db.session.commit()
@@ -208,6 +231,7 @@ Return ONLY valid JSON matching the format below:
         }
 
     def fallback_deterministic(self, case: Case):
+        print(f"[AGENT] [Deterministic Fallback] Scoring hospitals for case {case.id}...")
         data, required_specialty = self._build_hospital_data(case)
         if not data:
             if required_specialty:
@@ -237,11 +261,15 @@ Return ONLY valid JSON matching the format below:
             key=lambda h: (h["distance"], -h["icu_available"]),
         )
 
+        hosp = Hospital.query.get(best_hospital["hospital_id"])
+        hosp_name = hosp.name if hosp else f"Hospital {best_hospital['hospital_id']}"
+        print(f"[AGENT] Selected Hospital: {hosp_name} (Fallback Deterministic)")
+
         log = Logs(
             case_id=case.id,
-            agent_name="hospital_selection_agent",
-            message=f"Deterministic: selected hospital {best_hospital['hospital_id']}",
-            metadata="Based on resources and proximity",
+            agent_name='hospital_selection_agent',
+            message=f"Fallback selection used: hospital {best_hospital['hospital_id']}",
+            metadata_json="Based on resources and proximity",
         )
         db.session.add(log)
         db.session.commit()
