@@ -133,7 +133,6 @@ class Case(db.Model):
         if status not in self.VALID_STATUSES:
             raise ValueError(f"Invalid case status: {status}. Must be one of {self.VALID_STATUSES}")
         
-        # Enforce FSM transition rules
         old_status = getattr(self, 'status', None)
         if old_status and old_status != status:
             allowed = {
@@ -156,7 +155,6 @@ class Case(db.Model):
         return f'<Case {self.id} ({self.patient_name})>'
 
     def to_dict(self):
-        """Canonical serialization for case status updates."""
         return {
             'id': self.id,
             'patient_name': self.patient_name,
