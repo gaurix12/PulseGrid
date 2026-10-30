@@ -12,3 +12,4 @@ python-dotenv
 pydantic
 groq
 flask-socketio
+psycopg[binary]
