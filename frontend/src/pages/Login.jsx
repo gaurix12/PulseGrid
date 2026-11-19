@@ -10,20 +10,6 @@ function Login() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  const demoAccounts = {
-    'admin@pulsepath.local': { password: 'Admin123!', role: 'admin', username: 'City Admin' },
-    'hospital@pulsepath.local': {
-      password: 'Hospital123!',
-      role: 'hospital',
-      username: 'Hospital Admin',
-    },
-    'ambulance@pulsepath.local': {
-      password: 'Ambulance123!',
-      role: 'ambulance',
-      username: 'Ambulance Driver',
-    },
-  }
-
   if (user) {
     return <Navigate to={getRoleRoute(user.role)} replace />
   }
@@ -47,21 +33,6 @@ function Login() {
       navigate(getRoleRoute(nextUser.role), { replace: true })
       return
     } catch (err) {
-      const demoAccount = demoAccounts[email]
-      if (demoAccount && demoAccount.password === form.password) {
-        const nextUser = {
-          id: `demo-${demoAccount.role}`,
-          email,
-          username: demoAccount.username,
-          role: demoAccount.role,
-          hospital_id: demoAccount.role === 'hospital' ? 1 : undefined,
-          ambulance_id: demoAccount.role === 'ambulance' ? 1 : undefined,
-        }
-        login(nextUser)
-        navigate(getRoleRoute(nextUser.role), { replace: true })
-        return
-      }
-
       setError(err.message || 'Invalid email or password.')
     } finally {
       setLoading(false)

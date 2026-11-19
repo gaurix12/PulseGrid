@@ -9,7 +9,8 @@ PulseGrid is a polished command, triage, and routing console for emergency medic
 *   **Role-Based Access Control (RBAC)**: Tailored dashboards, workflows, and action items custom-scoped for **Admins/Dispatchers**, **Hospital Staff**, and **Ambulance Crews**.
 *   **Dynamic Multi-Agent Routing**: A coordinated LangGraph workflow executing sequence-dependent clinical operations (triage, dispatch, allocation) in a unified state.
 *   **Conversational Interface**: A natural-language chat assistant supporting scoped commands (e.g., "Assign ambulance 2 to case 5", "Update hospital 1 ICU beds by +3") with automatic permission gates.
-*   **Atomic Resource Bookings**: Secure SQLite transaction validation preventing race conditions or double-booking of critical supplies (ICU beds, regular beds, ventilators).
+*   **Atomic Resource Bookings**: Secure PostgreSQL transaction validation preventing race conditions or double-booking of critical supplies (ICU beds, regular beds, ventilators).
+*   **H3 Spatial Indexing**: Ambulance, hospital, and case locations use Uber H3 grid indexes at resolution 9 for proximity lookup and grid-distance ranking.
 
 *   **WebSocket Event Syncing**: Real-time server-client telemetry pushing live alerts and coordinate updates instantly across dashboards.
 *   **Fail-Safe Graceful Fallbacks**: Gracefully switches to deterministic, local rule-based heuristics if the external LLM provider is down or offline.
@@ -25,13 +26,13 @@ The system utilizes six specialized, role-focused AI agents:
     *   **Output**: Determines the case condition and assigns a clinical severity level from **P0** (highest) to **P3** (lowest).
 2.  **Dispatch Agent** ([dispatch_agent.py](file:///Users/gaurisudharsinip/Documents/agentic-ai/backend/agents/dispatch_agent.py))
     *   **Role**: Selects the initial combination of nearest available ambulance and optimal target hospital.
-    *   **Mechanism**: Uses heuristic ranking formulas based on geographic coordinate distances, bed availability, and ICU status.
+    *   **Mechanism**: Uses H3 grid distance, bed availability, and ICU status.
 3.  **Hospital Selection Agent** ([hospital_selection_agent.py](file:///Users/gaurisudharsinip/Documents/agentic-ai/backend/agents/hospital_selection_agent.py))
     *   **Role**: Validates the selected hospital against strict clinical requirements.
     *   **Constraint Enforcement**: Enforces hard filters such as specialty matching (e.g., Cardiology for chest pain, Trauma Care for accidents) and resource capabilities (ICU/ventilators for P0/P1 cases).
 4.  **Resource Allocation Agent** ([resource_allocation_agent.py](file:///Users/gaurisudharsinip/Documents/agentic-ai/backend/agents/resource_allocation_agent.py))
     *   **Role**: Allocates medical hardware and beds to incoming patient profiles.
-    *   **Mechanism**: Issues reservation entries in the SQLite database and executes atomic resource decrements to prevent double-booking.
+    *   **Mechanism**: Issues reservation entries in the PostgreSQL database and executes atomic resource decrements to prevent double-booking.
 5.  **Alert Agent** ([alert_agent.py](file:///Users/gaurisudharsinip/Documents/agentic-ai/backend/agents/alert_agent.py))
     *   **Role**: Prepares and routes emergency alerts to target facilities and staff.
 6.  **Chat Agent** ([chat_agent.py](file:///Users/gaurisudharsinip/Documents/agentic-ai/backend/agents/chat_agent.py))
@@ -66,6 +67,7 @@ graph TD
 ### 3. `dispatch` Node
 *   The `DispatchAgent` gathers idle ambulances and hospitals.
 *   Identifies the optimal pair (closest ambulance and high-scoring hospital) using custom soft-scoring heuristics.
+*   Nearby candidates are identified through H3 cells and ranked using H3 grid distance.
 
 ### 4. `hospital_selection` Node
 *   The `HospitalSelectionAgent` acts as a guardrail. 
@@ -85,5 +87,6 @@ graph TD
 
 ## Tech Stack
 
-*   **Backend**: Flask (Python), Flask-SQLAlchemy (SQLite database), Flask-SocketIO (Real-time updates), LangGraph, LangChain, Groq LLM API.
+*   **Backend**: Flask (Python), Flask-SQLAlchemy, PostgreSQL, Flask-SocketIO (Real-time updates), LangGraph, LangChain, Groq LLM API.
 *   **Frontend**: React (Vite), TailwindCSS, React-Leaflet (Maps), Zustand (State management), Axios.
+*   **Spatial Index**: Uber H3 resolution 9.

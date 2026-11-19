@@ -32,6 +32,12 @@ def emergency_flow():
         existing_case = Case.query.get(case_id)
         if not existing_case:
             return jsonify({"success": False, "message": f"Case {case_id} not found"}), 404
+        if session_role == 'hospital' and existing_case.hospital_id != hospital_user_id:
+            return jsonify({"success": False, "message": "Hospital users can only dispatch cases assigned to their hospital"}), 403
+        if session_role == 'ambulance' and existing_case.ambulance_id != ambulance_user_id:
+            return jsonify({"success": False, "message": "Ambulance users can only dispatch cases assigned to their ambulance"}), 403
+    elif session_role != 'admin':
+        return jsonify({"success": False, "message": "Only admins can create and dispatch a new case"}), 403
 
     if not existing_case and (not message or not location):
         return jsonify({"success": False, "message": "message and location are required when case_id is not provided"}), 400
@@ -118,6 +124,5 @@ def emergency_flow():
             "message": "Emergency workflow encountered an error",
             "error_message": str(e),
         }), 500
-
 
 

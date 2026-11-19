@@ -2,14 +2,14 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import CheckConstraint, UniqueConstraint, event
 from sqlalchemy.orm import validates
 from datetime import datetime
-
+from .utils.h3 import compute_h3_from_location, compute_h3_index
 db = SQLAlchemy()
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash = db.Column(db.String(128), nullable=False)
+    password_hash = db.Column(db.Text, nullable=False)
     role = db.Column(db.String(20), nullable=False)  # hospital, ambulance, admin
     hospital_id = db.Column(db.Integer, db.ForeignKey('hospital.id'), nullable=True)
     ambulance_id = db.Column(db.Integer, db.ForeignKey('ambulance.id'), nullable=True)
@@ -34,6 +34,7 @@ class Hospital(db.Model):
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     latitude = db.Column(db.Float, nullable=True)
     longitude = db.Column(db.Float, nullable=True)
+    h3_index = db.Column(db.String(20), nullable=True, index=True)
     phone_number = db.Column(db.String(30), nullable=True)
     contact_email = db.Column(db.String(120), nullable=True)
 
@@ -64,6 +65,7 @@ class Hospital(db.Model):
             'has_trauma_care': self.has_trauma_care,
             'latitude': self.latitude,
             'longitude': self.longitude,
+            'h3_index': self.h3_index,
             'phone_number': self.phone_number,
             'contact_email': self.contact_email,
             'created_at': self.created_at.isoformat() if self.created_at else None,
@@ -77,6 +79,7 @@ class Ambulance(db.Model):
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     current_latitude = db.Column(db.Float, nullable=True)
     current_longitude = db.Column(db.Float, nullable=True)
+    h3_index = db.Column(db.String(20), nullable=True, index=True)
     __table_args__ = (
         UniqueConstraint('current_case_id', name='unique_current_case'),
     )
@@ -93,6 +96,7 @@ class Ambulance(db.Model):
             'current_case_id': self.current_case_id,
             'current_latitude': self.current_latitude,
             'current_longitude': self.current_longitude,
+            'h3_index': self.h3_index,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -119,6 +123,7 @@ class Case(db.Model):
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     delay = db.Column(db.Boolean, default=False)
     status = db.Column(db.String(20), nullable=False, default='created')  
+    h3_index = db.Column(db.String(20), nullable=True, index=True)
 
     __table_args__ = (
         CheckConstraint("severity IN ('P0', 'P1', 'P2', 'P3')", name='check_case_severity'),
@@ -161,6 +166,7 @@ class Case(db.Model):
             'condition': self.condition,
             'severity': self.severity,
             'location': self.location,
+            'h3_index': self.h3_index,
             'ambulance_id': self.ambulance_id,
             'hospital_id': self.hospital_id,
             'status': self.status,
@@ -174,7 +180,7 @@ class Logs(db.Model):
     case_id = db.Column(db.Integer, db.ForeignKey('case.id'), nullable=True)
     agent_name = db.Column(db.String(120), nullable=False)
     message = db.Column(db.Text, nullable=False)
-    # Column is named 'log_metadata' in the existing SQLite DB
+    # Preserve the existing physical column name for PostgreSQL compatibility.
     metadata_json = db.Column('log_metadata', db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
 
@@ -211,3 +217,24 @@ class Reserved(db.Model):
 
     def __repr__(self):
         return f'<Reserved case={self.case_id} hospital={self.hospital_id} type={self.type}>'
+
+
+@event.listens_for(Hospital, "before_insert")
+@event.listens_for(Hospital, "before_update")
+def update_hospital_h3_index(mapper, connection, target):
+    target.h3_index = compute_h3_index(target.latitude, target.longitude)
+
+
+@event.listens_for(Ambulance, "before_insert")
+@event.listens_for(Ambulance, "before_update")
+def update_ambulance_h3_index(mapper, connection, target):
+    target.h3_index = compute_h3_index(
+        target.current_latitude,
+        target.current_longitude,
+    )
+
+
+@event.listens_for(Case, "before_insert")
+@event.listens_for(Case, "before_update")
+def update_case_h3_index(mapper, connection, target):
+    target.h3_index = compute_h3_from_location(target.location)

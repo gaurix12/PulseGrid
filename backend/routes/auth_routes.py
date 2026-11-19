@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
+import os
 
 from ..models import User, db
 
@@ -16,10 +17,16 @@ def register():
     if not username or not email or not password or not role:
         return jsonify({"message": "username, email, password, and role are required"}), 400
 
-    admin_exists = User.query.filter_by(role='admin').first() is not None
     if role == 'admin':
-        if admin_exists:
-            return jsonify({"message": "Admin account already exists. Contact an existing admin."}), 400
+        current_admin = session.get('role') == 'admin'
+        no_users_exist = User.query.count() == 0
+        bootstrap_token = os.getenv("ADMIN_BOOTSTRAP_TOKEN")
+        supplied_token = request.headers.get("X-Admin-Bootstrap-Token")
+        if not current_admin:
+            if not no_users_exist:
+                return jsonify({"message": "Admin registration requires an authenticated existing admin"}), 403
+            if not bootstrap_token or supplied_token != bootstrap_token:
+                return jsonify({"message": "Initial admin creation requires the configured bootstrap token"}), 403
     elif role not in {'hospital', 'ambulance'}:
         return jsonify({"message": "role must be one of: hospital, ambulance, admin (first user only)"}), 400
 

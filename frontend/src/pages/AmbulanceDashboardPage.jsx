@@ -3,8 +3,9 @@ import { useAuth } from '../context/AuthContext.jsx'
 import * as api from '../services/api.js'
 import { deriveAmbulancesFromCases, formatRelativeTime, sortCasesByPriority, severityScore } from '../utils/dispatchHelpers.js'
 import { useUiStore } from '../store/uiStore.js'
+import { h3GridDistance } from '../utils/incidentInsights.js'
 
-function calculateDistanceScore(caseItem, ambulanceLocation) {
+function calculateH3DistanceScore(caseItem, ambulanceLocation) {
   if (!ambulanceLocation?.lat || !ambulanceLocation?.lon) return 0
   const location = String(caseItem.location || '')
   const numericMatch = location.match(/(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)/)
@@ -12,8 +13,11 @@ function calculateDistanceScore(caseItem, ambulanceLocation) {
   const lat = Number(numericMatch[1])
   const lon = Number(numericMatch[2])
   if (Number.isNaN(lat) || Number.isNaN(lon)) return 0
-  const delta = Math.abs(lat - ambulanceLocation.lat) + Math.abs(lon - ambulanceLocation.lon)
-  return Math.max(0, 100 - delta * 100)
+  const distance = h3GridDistance(
+    { latitude: ambulanceLocation.lat, longitude: ambulanceLocation.lon },
+    { latitude: lat, longitude: lon },
+  )
+  return distance != null ? Math.max(0, 100 - distance) : 0
 }
 
 function AmbulanceDashboardPage() {
@@ -55,7 +59,7 @@ function AmbulanceDashboardPage() {
     return sortCasesByPriority(allCases)
       .map((item) => ({
         ...item,
-        distanceScore: calculateDistanceScore(item, ambulanceLocation),
+        distanceScore: calculateH3DistanceScore(item, ambulanceLocation),
       }))
       .sort((left, right) => {
         const severityDelta = severityScore(left.severity) - severityScore(right.severity)

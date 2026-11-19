@@ -21,9 +21,9 @@ const routeUpdates = [
 ]
 
 const nearbyHospitals = [
-  { name: 'St. Vincent', distance: '4.2 km', icu: '2 beds' },
-  { name: 'Royal Melbourne', distance: '5.1 km', icu: '1 bed' },
-  { name: 'Alfred', distance: '6.4 km', icu: '0 beds' },
+  { name: 'St. Vincent', distance: '2 H3 cells', icu: '2 beds' },
+  { name: 'Royal Melbourne', distance: '3 H3 cells', icu: '1 bed' },
+  { name: 'Alfred', distance: '4 H3 cells', icu: '0 beds' },
 ]
 
 const caseQueue = [

@@ -25,11 +25,6 @@ function writeSession(session) {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(session))
 }
 
-function buildToken(user) {
-  const suffix = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)
-  return `session_${user?.id || 'guest'}_${suffix}`
-}
-
 const initialSession = readSession()
 
 export const useAuthStore = create((set) => ({
@@ -39,8 +34,8 @@ export const useAuthStore = create((set) => ({
   permissions: initialSession?.user?.role ? permissionsByRole[initialSession.user.role] ?? [] : [],
   isAuthenticated: Boolean(initialSession?.user),
   hydrated: true,
-  setSession: (user, token) => {
-    const nextToken = token || buildToken(user)
+  setSession: (user) => {
+    const nextToken = null
     const nextSession = { user, token: nextToken }
     writeSession(nextSession)
     set({

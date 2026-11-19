@@ -24,10 +24,12 @@ def chat_message():
     if not user_role:
         return jsonify({"success": False, "response": "Authentication required", "data": None}), 401
 
-    if not hospital_user_id:
-        hospital_user_id = context.get('current_hospital_id')
-    if not ambulance_user_id:
-        ambulance_user_id = context.get('current_ambulance_id')
+    if user_role == 'hospital':
+        hospital_user_id = session.get('hospital_id')
+        ambulance_user_id = None
+    elif user_role == 'ambulance':
+        ambulance_user_id = session.get('ambulance_id')
+        hospital_user_id = None
 
     if not message or not str(message).strip():
         return jsonify({"success": False, "response": "message is required", "data": None}), 400

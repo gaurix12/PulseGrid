@@ -6,7 +6,7 @@ except Exception:
 from langchain_core.language_models.llms import LLM
 
 from ..models import Hospital, db, Case, Logs
-import math
+from ..utils.h3 import compute_h3_from_location, compute_h3_index, h3_grid_distance
 
 HOSPITAL_SELECTION_GUARDRAILS = """You are a hospital selection agent. Your role is to match a patient case with the most optimal hospital.
 
@@ -82,28 +82,11 @@ Return ONLY valid JSON matching the format below:
         
         return filtered
 
-    def calculate_distance(self, loc1: str, loc2: str) -> float:
-        if not loc1 or not loc2:
-            return 9999
-
-        try:
-            lat1, lon1 = map(float, loc1.split(","))
-            lat2, lon2 = map(float, loc2.split(","))
-        except (ValueError, AttributeError):
-            return 9999
-
-        r = 6371
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-
-        a = (
-            math.sin(dlat / 2) ** 2
-            + math.cos(math.radians(lat1))
-            * math.cos(math.radians(lat2))
-            * math.sin(dlon / 2) ** 2
-        )
-
-        return r * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+    def calculate_grid_distance(self, loc1: str, loc2: str) -> int:
+        return h3_grid_distance(
+            compute_h3_from_location(loc1),
+            compute_h3_from_location(loc2),
+        ) or 9999
 
     def _build_hospital_data(self, case: Case):
         hospitals = Hospital.query.all()
@@ -117,7 +100,15 @@ Return ONLY valid JSON matching the format below:
             if hosp_lat is None:
                 hosp_lat = getattr(hosp, "latitude", None)
 
-            distance = self.calculate_distance(case.location, f"{hosp_lat},{hosp.longitude}")
+            hospital_h3 = getattr(hosp, "h3_index", None) or compute_h3_index(
+                hosp_lat,
+                hosp.longitude,
+            )
+            distance = h3_grid_distance(
+                getattr(case, "h3_index", None) or compute_h3_from_location(case.location),
+                hospital_h3,
+            )
+            distance = distance if distance is not None else 9999
             data.append(
                 {
                     "hospital_id": hosp.id,
@@ -152,7 +143,7 @@ Return ONLY valid JSON matching the format below:
         hospitals_info = "\n".join(
             [
                 f"- Hospital {d['hospital_id']}: {d['beds_available']} beds, {d['icu_available']} ICU, {d['ventilators_available']} ventilators, "
-                f"Trauma: {d['has_trauma_care']}, Cardiology: {d['has_cardiology']}, Distance: {d['distance']:.1f}km"
+                f"Trauma: {d['has_trauma_care']}, Cardiology: {d['has_cardiology']}, H3 grid distance: {d['distance']} cells"
                 for d in data
             ]
         )

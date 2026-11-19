@@ -1,11 +1,15 @@
+from pathlib import Path
+
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 from flask import Flask, jsonify, request, session
 from flask_cors import CORS
 from flask_socketio import SocketIO
+from sqlalchemy import inspect, text
 
 from .config import Config
-from .models import db, User
+from .models import Ambulance, Case, Hospital, User, db
+from .utils.h3 import compute_h3_from_location, compute_h3_index
 from .routes.admin_routes import admin
 from .routes.ambulance_routes import ambulance
 from .routes.auth_routes import auth
@@ -24,7 +28,39 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 db.init_app(app)
 with app.app_context():
+    inspector = inspect(db.engine)
+    existing_tables = set(inspector.get_table_names())
+    for table_name in ("hospital", "ambulance", "case"):
+        if table_name in existing_tables:
+            columns = {column["name"] for column in inspector.get_columns(table_name)}
+            if "h3_index" not in columns:
+                db.session.execute(
+                    text(f'ALTER TABLE "{table_name}" ADD COLUMN h3_index VARCHAR(20)')
+                )
+    db.session.commit()
     db.create_all()
+    for table_name in ("hospital", "ambulance", "case"):
+        db.session.execute(
+            text(
+                f'CREATE INDEX IF NOT EXISTS "ix_{table_name}_h3_index" '
+                f'ON "{table_name}" (h3_index)'
+            )
+        )
+    db.session.commit()
+
+    for hospital_record in Hospital.query.all():
+        hospital_record.h3_index = compute_h3_index(
+            hospital_record.latitude,
+            hospital_record.longitude,
+        )
+    for ambulance_record in Ambulance.query.all():
+        ambulance_record.h3_index = compute_h3_index(
+            ambulance_record.current_latitude,
+            ambulance_record.current_longitude,
+        )
+    for case_record in Case.query.all():
+        case_record.h3_index = compute_h3_from_location(case_record.location)
+    db.session.commit()
 
 ALLOWED_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173"}
 
@@ -50,22 +86,6 @@ def load_session_from_token():
             resp.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
         return resp
 
-    auth_header = request.headers.get('Authorization')
-    if auth_header and auth_header.startswith('Bearer '):
-        token = auth_header.split(' ')[1]
-        parts = token.split('_')
-        if len(parts) >= 2 and parts[0] == 'session':
-            try:
-                user_id = int(parts[1])
-                user = User.query.get(user_id)
-                if user:
-                    session['user_id'] = user.id
-                    session['username'] = user.username
-                    session['role'] = user.role
-                    session['hospital_id'] = user.hospital_id
-                    session['ambulance_id'] = user.ambulance_id
-            except Exception:
-                pass
 
 @app.route('/')
 def index():

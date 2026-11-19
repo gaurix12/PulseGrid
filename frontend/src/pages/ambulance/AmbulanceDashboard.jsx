@@ -4,7 +4,7 @@ import PropTypes from 'prop-types'
 import { useAuth } from '../../context/AuthContext.jsx'
 import * as api from '../../services/api.js'
 import { useUiStore } from '../../store/uiStore.js'
-import { haversineKm, parseCaseCoordinates, sortCasesByPriority } from '../../utils/incidentInsights.js'
+import { h3GridDistance, parseCaseCoordinates, sortCasesByPriority } from '../../utils/incidentInsights.js'
 import ChatAssistant from '../../components/shared/ChatAssistant.jsx'
 import { POLLING } from '../../constants/polling.js'
 
@@ -84,15 +84,14 @@ function displayStatusFromBackend(status) {
   }
 }
 
-function formatKm(distanceKm) {
-  if (distanceKm == null || Number.isNaN(distanceKm)) return '—'
-  if (distanceKm < 1) return `${Math.round(distanceKm * 1000)} m`
-  return `${distanceKm.toFixed(1)} km`
+function formatH3Distance(gridDistance) {
+  if (gridDistance == null || Number.isNaN(gridDistance)) return '—'
+  return `${gridDistance} H3 cells`
 }
 
-function formatTravelMinutes(distanceKm) {
-  if (distanceKm == null || Number.isNaN(distanceKm)) return '—'
-  return `${Math.max(1, Math.round(distanceKm * 3.5))} min`
+function formatTravelMinutes(gridDistance) {
+  if (gridDistance == null || Number.isNaN(gridDistance)) return '—'
+  return `${Math.max(1, gridDistance * 4)} min`
 }
 
 function getCaseId(item) {
@@ -145,9 +144,9 @@ function getStatusTone(status) {
   }
 }
 
-function calculateDistanceKm(from, to) {
+function calculateH3Distance(from, to) {
   if (!from || !to) return null
-  return haversineKm(from, to)
+  return h3GridDistance(from, to)
 }
 
 function AmbulanceDashboard() {
@@ -270,11 +269,10 @@ function AmbulanceDashboard() {
     }
   }, [assignedCase])
 
-  const distanceToCase = useMemo(() => calculateDistanceKm(ambulanceLocation, activeCaseLocation), [ambulanceLocation, activeCaseLocation])
-  const distanceToHospital = useMemo(() => calculateDistanceKm(activeCaseLocation, activeHospitalLocation), [activeCaseLocation, activeHospitalLocation])
+  const distanceToCase = useMemo(() => calculateH3Distance(ambulanceLocation, activeCaseLocation), [ambulanceLocation, activeCaseLocation])
+  const distanceToHospital = useMemo(() => calculateH3Distance(activeCaseLocation, activeHospitalLocation), [activeCaseLocation, activeHospitalLocation])
 
   const currentCase = assignedCase || null
-  const headerDistance = distanceToCase != null ? formatKm(distanceToCase) : '—'
   const selectedWorkflowLabel = workflowStatus || displayStatusFromBackend(currentStatus)
 
   const updateStatus = async (nextStatus) => {
@@ -450,8 +448,8 @@ function AmbulanceDashboard() {
                   <InfoCard label="Condition" value={getCondition(currentCase)} />
                   <InfoCard label="Case Location" value={safeString(currentCase.location)} />
                   <InfoCard label="Hospital" value={currentHospital ? `${currentHospital.name || 'Assigned hospital'} · ${currentHospital.location || 'Unknown location'}` : 'Pending'} />
-                  <InfoCard label="Distance to Case" value={formatKm(distanceToCase)} />
-                  <InfoCard label="Distance to Hospital" value={formatKm(distanceToHospital)} />
+                  <InfoCard label="Distance to Case" value={formatH3Distance(distanceToCase)} />
+                  <InfoCard label="Distance to Hospital" value={formatH3Distance(distanceToHospital)} />
                   <InfoCard label="Travel Time" value={formatTravelMinutes(distanceToCase)} />
                   <InfoCard label="Status" value={safeString(selectedWorkflowLabel || currentCase.status || currentStatus)} />
                 </div>

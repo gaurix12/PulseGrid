@@ -11,15 +11,14 @@ import TopBar from '../components/TopBar.jsx'
 import {
   buildCaseQueue,
   formatTimeAgo,
-  haversineKm,
+  h3GridDistance,
   parseCaseCoordinates,
   sortCasesByPriority,
 } from '../utils/incidentInsights.js'
 
-function describeDistance(distanceKm) {
-  if (distanceKm == null) return 'Unknown distance'
-  if (distanceKm < 1) return `${Math.round(distanceKm * 1000)} m away`
-  return `${distanceKm.toFixed(1)} km away`
+function describeDistance(gridDistance) {
+  if (gridDistance == null) return 'Unknown distance'
+  return `${gridDistance} H3 cells away`
 }
 
 function AmbulanceQuickAccess() {
@@ -64,7 +63,7 @@ function AmbulanceQuickAccess() {
 
   const nearbyCases = useMemo(() => {
     return recommendedQueue
-      .filter((item) => item.distanceKm == null || item.distanceKm <= 20)
+      .filter((item) => item.h3GridDistance == null || item.h3GridDistance <= 20)
       .slice(0, 5)
   }, [recommendedQueue])
 
@@ -272,7 +271,7 @@ function AmbulanceQuickAccess() {
   const activeCaseCoords = parseCaseCoordinates(activeCase)
   const etaEstimate =
     origin && activeCaseCoords
-      ? Math.max(3, Math.round((haversineKm(origin, activeCaseCoords) || 0) * 2.4))
+      ? Math.max(3, (h3GridDistance(origin, activeCaseCoords) || 0) * 4)
       : null
 
   const stats = [
@@ -465,7 +464,7 @@ function AmbulanceQuickAccess() {
                   <div>
                     <strong>Case {item.id}</strong>
                     <span>
-                      {item.severity || 'P2'} · {item.distanceKm != null ? describeDistance(item.distanceKm) : 'Location pending'}
+                      {item.severity || 'P2'} · {item.h3GridDistance != null ? describeDistance(item.h3GridDistance) : 'Location pending'}
                     </span>
                   </div>
                   <div className="button-row" style={{ gap: '8px' }}>

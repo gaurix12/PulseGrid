@@ -4,7 +4,7 @@ import { CircleMarker, MapContainer, Marker, Popup, TileLayer, Tooltip } from 'r
 import 'leaflet/dist/leaflet.css'
 import { changeAmbulance, changeHospital, getAllCases, getHospitals } from '../../services/api.js'
 import { useUiStore } from '../../store/uiStore.js'
-import { haversineKm, parseCaseCoordinates, sortCasesByPriority } from '../../utils/incidentInsights.js'
+import { h3GridDistance, parseCaseCoordinates, sortCasesByPriority } from '../../utils/incidentInsights.js'
 
 const CHENNAI_CENTER = [13.0827, 80.2707]
 const REFRESH_MS = 3000
@@ -209,13 +209,13 @@ function recommendAmbulance(caseItem, ambulances) {
   const caseLocation = getCaseCoordinates(caseItem)
   const scored = ambulances.map((ambulance) => {
     const location = ambulance.location
-    const distanceKm = caseLocation && location ? haversineKm(caseLocation, location) : null
+    const gridDistance = caseLocation && location ? h3GridDistance(caseLocation, location) : null
     const idleScore = ambulance.status === 'idle' ? 0 : 1
     const loadScore = Number(ambulance.loadCount || 0)
 
     return {
       ...ambulance,
-      distanceKm,
+      gridDistance,
       idleScore,
       loadScore,
     }
@@ -223,8 +223,8 @@ function recommendAmbulance(caseItem, ambulances) {
 
   scored.sort((left, right) => {
     if (left.idleScore !== right.idleScore) return left.idleScore - right.idleScore
-    if ((left.distanceKm ?? Number.POSITIVE_INFINITY) !== (right.distanceKm ?? Number.POSITIVE_INFINITY)) {
-      return (left.distanceKm ?? Number.POSITIVE_INFINITY) - (right.distanceKm ?? Number.POSITIVE_INFINITY)
+    if ((left.gridDistance ?? Number.POSITIVE_INFINITY) !== (right.gridDistance ?? Number.POSITIVE_INFINITY)) {
+      return (left.gridDistance ?? Number.POSITIVE_INFINITY) - (right.gridDistance ?? Number.POSITIVE_INFINITY)
     }
     if (left.loadScore !== right.loadScore) return left.loadScore - right.loadScore
     return Number(left.id) - Number(right.id)
@@ -322,7 +322,7 @@ function CaseMap() {
       const loadLabel = ambulance.loadCount > 0 ? `${ambulance.loadCount} active case${ambulance.loadCount === 1 ? '' : 's'}` : 'Idle'
       const displayLocation = ambulance.location || getCaseCoordinates(ambulance.latestCase)
       const referenceCase = ambulance.latestCase || null
-      const caseDistance = referenceCase && displayLocation ? haversineKm(getCaseCoordinates(referenceCase), displayLocation) : null
+      const caseDistance = referenceCase && displayLocation ? h3GridDistance(getCaseCoordinates(referenceCase), displayLocation) : null
 
       return {
         ...ambulance,

@@ -127,14 +127,17 @@ def get_hospital(hospital_id):
 
 @hospital.route('/get-cases/<hospital_id>', methods=['GET'])
 def get_cases(hospital_id):
-    if not hospital_id:
-        return jsonify({"message": "hospital_id is required"}), 400
+    try:
+        route_hospital_id = int(hospital_id)
+    except (TypeError, ValueError):
+        return jsonify({"message": "hospital_id must be an integer"}), 400
+
     role = session.get('role')
     if role not in ['hospital', 'admin']:
         return jsonify({"message": "Unauthorized"}), 403
-    if role == 'hospital' and session.get('hospital_id') != int(hospital_id):
+    if role == 'hospital' and session.get('hospital_id') != route_hospital_id:
         return jsonify({"message": "Unauthorized"}), 403
-    cases = Case.query.filter_by(hospital_id=hospital_id).all()
+    cases = Case.query.filter_by(hospital_id=route_hospital_id).all()
     res = []
     for c in cases:
         res.append({

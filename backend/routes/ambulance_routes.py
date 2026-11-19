@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request, session
 from ..models import Case, db, Ambulance, Hospital, User
+from ..utils.h3 import compute_h3_index, h3_grid_distance
 
 ambulance = Blueprint('ambulance', __name__)
 
@@ -212,9 +213,16 @@ def update_location(ambulance_id):
         if case and case.hospital_id:
             hosp = Hospital.query.get(case.hospital_id)
             if hosp and hosp.latitude is not None and hosp.longitude is not None:
-                lat_diff = abs(float(amb.current_latitude) - float(hosp.latitude))
-                lon_diff = abs(float(amb.current_longitude) - float(hosp.longitude))
-                if lat_diff < 0.001 and lon_diff < 0.001:
+                ambulance_h3 = amb.h3_index or compute_h3_index(
+                    amb.current_latitude,
+                    amb.current_longitude,
+                )
+                hospital_h3 = hosp.h3_index or compute_h3_index(
+                    hosp.latitude,
+                    hosp.longitude,
+                )
+                grid_distance = h3_grid_distance(ambulance_h3, hospital_h3)
+                if grid_distance is not None and grid_distance <= 1:
                     case.status = 'arrived'
                     amb.status = 'idle'
                     amb.current_case_id = None

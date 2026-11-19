@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from math import asin, cos, radians, sin, sqrt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from langchain_core.tools import tool
 from sqlalchemy import func
 from ..models import Ambulance, Case, Hospital, Logs, Reserved, Resource, db
+from ..utils.h3 import compute_h3_from_location, compute_h3_index, h3_grid_distance
 
 
 READ_ONLY_TOOLS = {
@@ -86,6 +86,7 @@ def _serialize_hospital(hospital: Hospital) -> Dict[str, Any]:
         "has_trauma_care": hospital.has_trauma_care,
         "latitude": hospital.latitude,
         "longitude": hospital.longitude,
+        "h3_index": hospital.h3_index,
     }
 
 
@@ -97,6 +98,7 @@ def _serialize_ambulance(ambulance: Ambulance) -> Dict[str, Any]:
         "current_case_id": ambulance.current_case_id,
         "current_latitude": ambulance.current_latitude,
         "current_longitude": ambulance.current_longitude,
+        "h3_index": ambulance.h3_index,
     }
 
 
@@ -107,6 +109,7 @@ def _serialize_case(case: Case) -> Dict[str, Any]:
         "severity": case.severity,
         "condition": case.condition,
         "location": case.location,
+        "h3_index": case.h3_index,
         "ambulance_id": case.ambulance_id,
         "hospital_id": case.hospital_id,
         "delay": case.delay,
@@ -156,25 +159,6 @@ def _write_tool_audit_log(
     # NOTE: Commit moved to invoke_tool for transaction atomicity
     return log_entry.id
     
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius_km = 6371.0
-    d_lat = radians(lat2 - lat1)
-    d_lon = radians(lon2 - lon1)
-    a = sin(d_lat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(d_lon / 2) ** 2
-    return 2 * radius_km * asin(sqrt(a))
-
-
-def _parse_coordinates(value: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
-    if not value:
-        return None, None
-
-    parts = [part.strip() for part in str(value).replace(";", ",").split(",")]
-    if len(parts) < 2:
-        return None, None
-
-    return _safe_float(parts[0]), _safe_float(parts[1])
-
-
 def _severity_weight(severity: Optional[str]) -> int:
     if not severity:
         return 1
@@ -213,20 +197,39 @@ def _authorize_tool_call(
     # When a hospital/ambulance user calls a read tool without specifying
     # a specific ID, inject their own entity ID so they only see their own data.
     if role == "hospital" and user_hospital_id is not None:
+        if tool_name == "fetch_hospital_data" and kwargs.get("hospital_id") is not None:
+            if _safe_int(kwargs.get("hospital_id")) != user_hospital_id:
+                return {"success": False, "error": "Hospital users can only access their own hospital"}
+        if tool_name == "fetch_resource_snapshot" and kwargs.get("hospital_id") is not None:
+            if _safe_int(kwargs.get("hospital_id")) != user_hospital_id:
+                return {"success": False, "error": "Hospital users can only access their own hospital resources"}
         if tool_name in {"fetch_hospital_data", "fetch_resource_snapshot"}:
             if kwargs.get("hospital_id") is None:
                 kwargs["hospital_id"] = user_hospital_id
         if tool_name == "fetch_case_data":
             if kwargs.get("case_id") is None and kwargs.get("hospital_id") is None:
                 kwargs["hospital_id"] = user_hospital_id
+            if kwargs.get("case_id") is not None:
+                case_id = _safe_int(kwargs.get("case_id"))
+                case_obj = Case.query.get(case_id) if case_id is not None else None
+                if case_obj and case_obj.hospital_id != user_hospital_id:
+                    return {"success": False, "error": "Hospital users can only access cases assigned to their hospital"}
 
     if role == "ambulance" and user_ambulance_id is not None:
+        if tool_name == "fetch_ambulance_data" and kwargs.get("ambulance_id") is not None:
+            if _safe_int(kwargs.get("ambulance_id")) != user_ambulance_id:
+                return {"success": False, "error": "Ambulance users can only access their own ambulance"}
         if tool_name == "fetch_ambulance_data":
             if kwargs.get("ambulance_id") is None:
                 kwargs["ambulance_id"] = user_ambulance_id
         if tool_name == "fetch_case_data":
             if kwargs.get("case_id") is None and kwargs.get("ambulance_id") is None:
                 kwargs["ambulance_id"] = user_ambulance_id
+            if kwargs.get("case_id") is not None:
+                case_id = _safe_int(kwargs.get("case_id"))
+                case_obj = Case.query.get(case_id) if case_id is not None else None
+                if case_obj and case_obj.ambulance_id != user_ambulance_id:
+                    return {"success": False, "error": "Ambulance users can only access cases assigned to their ambulance"}
 
     # ── Mutation ownership checks ────────────────────────────────────────
     if role == "hospital" and tool_name in {"update_hospital_resources", "reserve_resources"}:
@@ -247,6 +250,11 @@ def _authorize_tool_call(
         ambulance_id = _safe_int(kwargs.get("ambulance_id"))
         if user_ambulance_id is not None and ambulance_id is not None and user_ambulance_id != ambulance_id:
             return {"success": False, "error": "Ambulance users can only act on their own ambulance"}
+        if tool_name == "assign_ambulance_to_case":
+            case_id = _safe_int(kwargs.get("case_id"))
+            case_obj = Case.query.get(case_id) if case_id is not None else None
+            if case_obj and case_obj.ambulance_id not in (None, user_ambulance_id):
+                return {"success": False, "error": "Ambulance users cannot assign cases belonging to another ambulance"}
 
     return None
 
@@ -546,7 +554,6 @@ def update_hospital_resources(
                 status="available",
             ))
 
-        db.session.commit()
         return {
             "success": True,
             "hospital_id": hospital.id,
@@ -577,7 +584,6 @@ def update_ambulance_status(ambulance_id: int, status: str) -> Dict[str, Any]:
             }
 
         ambulance.status = normalized_status
-        db.session.commit()
         return {
             "success": True,
             "ambulance_id": ambulance.id,
@@ -604,7 +610,6 @@ def update_ambulance_location(
 
         ambulance.current_latitude = float(current_latitude)
         ambulance.current_longitude = float(current_longitude)
-        db.session.commit()
         return {
             "success": True,
             "ambulance_id": ambulance.id,
@@ -660,7 +665,6 @@ def assign_ambulance_to_case(ambulance_id: int, case_id: int) -> Dict[str, Any]:
         ambulance.status = "assigned"
         ambulance.current_case_id = case.id
         case.ambulance_id = ambulance.id
-        db.session.commit()
         return {
             "success": True,
             "ambulance_id": ambulance.id,
@@ -685,21 +689,72 @@ def reserve_resources(
     """Reserve resources (bed/icu/ventilator) for a case at a hospital."""
     try:
         case = Case.query.get(case_id)
-        hospital = Hospital.query.get(hospital_id)
+        hospital = Hospital.query.with_for_update().get(hospital_id)
         if not case:
             return {"success": False, "error": f"Case {case_id} not found"}
         if not hospital:
             return {"success": False, "error": f"Hospital {hospital_id} not found"}
 
+        canonical_type = str(resource_type or "").strip().lower()
+        aliases = {"bed": "bed", "beds": "bed", "icu": "icu", "ventilator": "ventilator", "ventilators": "ventilator"}
+        canonical_type = aliases.get(canonical_type)
+        if canonical_type is None:
+            return {"success": False, "error": "resource_type must be bed, icu, or ventilator"}
+
+        quantity = int(quantity)
+        if quantity < 1:
+            return {"success": False, "error": "quantity must be at least 1"}
+
+        if canonical_type == "bed":
+            available_field = hospital.beds_available
+        elif canonical_type == "icu":
+            available_field = hospital.icu_available
+        else:
+            available_field = hospital.ventilators_available
+
+        if quantity > available_field:
+            return {"success": False, "error": f"Only {available_field} {canonical_type}(s) available"}
+
+        resource = Resource.query.with_for_update().filter_by(
+            hospital_id=hospital.id,
+            resource_type=canonical_type,
+        ).first()
+        if resource is None:
+            if canonical_type == "bed":
+                total, available = hospital.beds_total, hospital.beds_available
+            elif canonical_type == "icu":
+                total, available = hospital.icu_total, hospital.icu_available
+            else:
+                total, available = hospital.ventilators_total, hospital.ventilators_available
+            resource = Resource(
+                hospital_id=hospital.id,
+                resource_type=canonical_type,
+                total=total,
+                available=available,
+                status="available",
+            )
+            db.session.add(resource)
+            db.session.flush()
+
+        if quantity > resource.available:
+            return {"success": False, "error": f"Only {resource.available} {canonical_type}(s) available"}
+
+        resource.available -= quantity
+        if canonical_type == "bed":
+            hospital.beds_available = resource.available
+        elif canonical_type == "icu":
+            hospital.icu_available = resource.available
+        else:
+            hospital.ventilators_available = resource.available
+
         reservation = Reserved(
             case_id=case.id,
             hospital_id=hospital.id,
-            type=resource_type,
-            quantity=int(quantity),
+            type=canonical_type,
+            quantity=quantity,
             status="reserved",
         )
         db.session.add(reservation)
-        db.session.commit()
         return {
             "success": True,
             "case_id": case.id,
@@ -721,7 +776,6 @@ def confirm_reservation(case_id: int) -> Dict[str, Any]:
         reservations = Reserved.query.filter_by(case_id=case_id, status="reserved").all()
         for reservation in reservations:
             reservation.status = "confirmed"
-        db.session.commit()
         return {
             "success": True,
             "case_id": case_id,
@@ -768,7 +822,6 @@ def release_resources(case_id: int) -> Dict[str, Any]:
             })
             reservation.status = 'cancelled'
 
-        db.session.commit()
         return {
             "success": True,
             "case_id": case_id,
@@ -807,6 +860,7 @@ def recommend_hospital_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]:
             candidate_hospitals = hospitals
 
         ranking: List[Dict[str, Any]] = []
+        case_h3 = case.h3_index or compute_h3_from_location(case.location)
 
         for hospital in candidate_hospitals:
             capacity_score = (hospital.beds_available or 0) * 2
@@ -829,18 +883,41 @@ def recommend_hospital_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]:
             if hospital.capacity:
                 occupancy_penalty = round(((hospital.current_patients or 0) / hospital.capacity) * 10, 1)
 
-            score = capacity_score + icu_score + ventilator_score + specialty_score - occupancy_penalty
+            hospital_h3 = hospital.h3_index or compute_h3_index(
+                hospital.latitude,
+                hospital.longitude,
+            )
+            grid_distance = h3_grid_distance(case_h3, hospital_h3)
+            proximity_score = max(0, 8 - grid_distance) if grid_distance is not None else 0
+            if grid_distance is not None:
+                reasons.append(f"H3 grid distance {grid_distance} cells")
+
+            score = (
+                capacity_score
+                + icu_score
+                + ventilator_score
+                + specialty_score
+                + proximity_score
+                - occupancy_penalty
+            )
             ranking.append(
                 {
                     "hospital_id": hospital.id,
                     "hospital": hospital.name,
                     "score": round(score, 2),
                     "reasons": reasons or ["availability and capacity"],
+                    "h3_grid_distance": grid_distance,
                     "snapshot": _serialize_hospital(hospital),
                 }
             )
 
-        ranking.sort(key=lambda item: item["score"], reverse=True)
+        ranking.sort(
+            key=lambda item: (
+                -item["score"],
+                item["h3_grid_distance"] is None,
+                item["h3_grid_distance"] if item["h3_grid_distance"] is not None else 9999,
+            )
+        )
         return {
             "success": True,
             "case_id": case_id,
@@ -908,22 +985,28 @@ def recommend_ambulance_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]
         if not case:
             return {"success": False, "error": f"Case {case_id} not found"}
 
-        case_lat, case_lon = _parse_coordinates(case.location)
+        case_h3 = case.h3_index or compute_h3_from_location(case.location)
         ambulances = Ambulance.query.filter_by(status="idle").all()
         ranking: List[Dict[str, Any]] = []
 
         for ambulance in ambulances:
             score = 10.0
             reasons: List[str] = ["idle and available"]
+            grid_distance = None
 
             if ambulance.current_latitude is not None and ambulance.current_longitude is not None:
                 score += 3
                 reasons.append("has live coordinates")
 
-            if case_lat is not None and case_lon is not None and ambulance.current_latitude is not None and ambulance.current_longitude is not None:
-                distance = _haversine_km(case_lat, case_lon, float(ambulance.current_latitude), float(ambulance.current_longitude))
-                score += max(0, 8 - distance)
-                reasons.append(f"estimated distance {round(distance, 2)} km")
+            ambulance_h3 = ambulance.h3_index or compute_h3_index(
+                ambulance.current_latitude,
+                ambulance.current_longitude,
+            )
+            if case_h3 and ambulance_h3:
+                grid_distance = h3_grid_distance(case_h3, ambulance_h3)
+                if grid_distance is not None:
+                    score += max(0, 8 - grid_distance)
+                    reasons.append(f"H3 grid distance {grid_distance} cells")
 
             ranking.append(
                 {
@@ -931,11 +1014,18 @@ def recommend_ambulance_for_case(case_id: int, top_k: int = 3) -> Dict[str, Any]
                     "driver_name": ambulance.driver_name,
                     "score": round(score, 2),
                     "reasons": reasons,
+                    "h3_grid_distance": grid_distance,
                     "snapshot": _serialize_ambulance(ambulance),
                 }
             )
 
-        ranking.sort(key=lambda item: item["score"], reverse=True)
+        ranking.sort(
+            key=lambda item: (
+                item["h3_grid_distance"] is None,
+                item["h3_grid_distance"] if item["h3_grid_distance"] is not None else 9999,
+                -item["score"],
+            )
+        )
         return {
             "success": True,
             "case_id": case_id,
@@ -956,7 +1046,6 @@ def log_decision(case_id: int, agent_name: str, message: str, metadata: Optional
             metadata_json=metadata or "",
         )
         db.session.add(log)
-        db.session.commit()
         return {
             "success": True,
             "log_id": log.id,
@@ -1015,7 +1104,6 @@ def update_case_status(case_id: int, status: str) -> Dict[str, Any]:
                 res.status = 'cancelled'
         
         db.session.add(case)
-        db.session.commit()
         return {
             "success": True,
             "message": f"Case {case_id} status updated to {status}",
@@ -1079,35 +1167,31 @@ def transfer_case_to_another_hospital(case: Case) -> Dict[str, Any]:
         }
 
     suitable_hospitals = []
+    case_h3 = case.h3_index or compute_h3_from_location(case.location)
     for hosp in candidate_hospitals:
-        lat1, lon1 = _parse_coordinates(case.location)
-        lat2, lon2 = hosp.latitude, hosp.longitude
-        distance = 9999.0
-        if lat1 is not None and lon1 is not None and lat2 is not None and lon2 is not None:
-            distance = _haversine_km(lat1, lon1, lat2, lon2)
+        hosp_h3 = hosp.h3_index or compute_h3_index(hosp.latitude, hosp.longitude)
+        grid_distance = h3_grid_distance(case_h3, hosp_h3)
+        grid_distance = grid_distance if grid_distance is not None else 9999
 
         if case.severity in ('P0', 'P1'):
             if hosp.icu_available > 0 and hosp.beds_available > 0:
-                suitable_hospitals.append((hosp, distance))
+                suitable_hospitals.append((hosp, grid_distance))
         else:
             if hosp.beds_available > 0:
-                suitable_hospitals.append((hosp, distance))
+                suitable_hospitals.append((hosp, grid_distance))
 
     if not suitable_hospitals:
         for hosp in candidate_hospitals:
             if hosp.beds_available > 0:
-                lat1, lon1 = _parse_coordinates(case.location)
-                lat2, lon2 = hosp.latitude, hosp.longitude
-                distance = 9999.0
-                if lat1 is not None and lon1 is not None and lat2 is not None and lon2 is not None:
-                    distance = _haversine_km(lat1, lon1, lat2, lon2)
-                suitable_hospitals.append((hosp, distance))
+                hosp_h3 = hosp.h3_index or compute_h3_index(hosp.latitude, hosp.longitude)
+                grid_distance = h3_grid_distance(case_h3, hosp_h3)
+                suitable_hospitals.append((hosp, grid_distance if grid_distance is not None else 9999))
 
     if not suitable_hospitals:
         return {"success": False, "error": "No other hospitals have available beds for transfer"}
 
     suitable_hospitals.sort(key=lambda x: (x[1], -x[0].icu_available, -x[0].beds_available))
-    new_hospital, distance = suitable_hospitals[0]
+    new_hospital, grid_distance = suitable_hospitals[0]
 
     # 3. Reserve resources at the new hospital
     needs = []
@@ -1158,7 +1242,7 @@ def transfer_case_to_another_hospital(case: Case) -> Dict[str, Any]:
             "old_hospital_id": old_hospital_id,
             "new_hospital_id": new_hospital.id,
             "allocated_resources": allocated_resources,
-            "distance_km": round(distance, 2) if distance != 9999 else None,
+            "h3_grid_distance": grid_distance if grid_distance != 9999 else None,
             "timestamp": datetime.utcnow().isoformat()
         }, default=str)
     )
@@ -1329,7 +1413,6 @@ def update_case_data(
             return {"success": True, "message": "No changes requested for case", "case_id": case.id}
 
         db.session.add(case)
-        db.session.commit()
         return {
             "success": True,
             "message": f"Case {case.id} updated successfully: {', '.join(changes)}",
@@ -1399,7 +1482,7 @@ def invoke_tool(
                 started_at=started_at,
                 ended_at=datetime.utcnow(),
             )
-            db.session.commit()
+            db.session.flush()
         except Exception:
             db.session.rollback()
         return result
@@ -1425,7 +1508,7 @@ def invoke_tool(
                 started_at=started_at,
                 ended_at=datetime.utcnow(),
             )
-            db.session.commit()
+            db.session.flush()
         except Exception:
             db.session.rollback()
         return auth_error
@@ -1453,8 +1536,7 @@ def invoke_tool(
                 started_at=started_at,
                 ended_at=datetime.utcnow(),
             )
-            # Commit the outer transaction (includes tool + audit log)
-            db.session.commit()
+            db.session.flush()
         except Exception as audit_error:
             # Audit log failed - rollback tool execution via savepoint
             savepoint.rollback()
@@ -1476,7 +1558,7 @@ def invoke_tool(
                     started_at=started_at,
                     ended_at=datetime.utcnow(),
                 )
-                db.session.commit()
+                db.session.flush()
             except Exception:
                 db.session.rollback()
         return result
@@ -1497,7 +1579,7 @@ def invoke_tool(
                 started_at=started_at,
                 ended_at=datetime.utcnow(),
             )
-            db.session.commit()
+            db.session.flush()
         except Exception:
             db.session.rollback()
         return result

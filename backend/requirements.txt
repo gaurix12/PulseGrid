@@ -1,4 +1,5 @@
 Flask
+Flask-SQLAlchemy
 Flask-Cors
 Flask-JWT-Extended
 SQLAlchemy
@@ -13,3 +14,4 @@ pydantic
 groq
 flask-socketio
 psycopg[binary]
+h3

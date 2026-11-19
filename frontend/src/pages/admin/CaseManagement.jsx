@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { changeAmbulance, changeHospital, getAllCases, getHospitals } from '../../services/api.js'
 import { useUiStore } from '../../store/uiStore.js'
-import { haversineKm, parseCaseCoordinates, sortCasesByPriority } from '../../utils/incidentInsights.js'
+import { h3GridDistance, parseCaseCoordinates, sortCasesByPriority } from '../../utils/incidentInsights.js'
 
 const STATUS_OPTIONS = ['All', 'triaged', 'dispatched', 'en-route', 'arrived', 'discharged', 'failed']
 const SEVERITY_OPTIONS = ['All', 'P0', 'P1', 'P2', 'P3']
@@ -158,21 +158,21 @@ function recommendAmbulance(caseItem, ambulances) {
   const sorted = [...ambulances]
     .map((ambulance) => {
       const location = getAmbulanceLocation(ambulance)
-      const distanceKm = caseLocation && location ? haversineKm(caseLocation, location) : null
+      const gridDistance = caseLocation && location ? h3GridDistance(caseLocation, location) : null
       const idleScore = normalizeStatus(ambulance.status) === 'idle' ? 0 : 1
       const loadScore = Number(ambulance.activeCaseCount || 0)
 
       return {
         ...ambulance,
-        distanceKm,
+        gridDistance,
         idleScore,
         loadScore,
       }
     })
     .sort((left, right) => {
       if (left.idleScore !== right.idleScore) return left.idleScore - right.idleScore
-      if ((left.distanceKm ?? Number.POSITIVE_INFINITY) !== (right.distanceKm ?? Number.POSITIVE_INFINITY)) {
-        return (left.distanceKm ?? Number.POSITIVE_INFINITY) - (right.distanceKm ?? Number.POSITIVE_INFINITY)
+      if ((left.gridDistance ?? Number.POSITIVE_INFINITY) !== (right.gridDistance ?? Number.POSITIVE_INFINITY)) {
+        return (left.gridDistance ?? Number.POSITIVE_INFINITY) - (right.gridDistance ?? Number.POSITIVE_INFINITY)
       }
       if (left.loadScore !== right.loadScore) return left.loadScore - right.loadScore
       return Number(left.id) - Number(right.id)
@@ -524,7 +524,7 @@ function CaseManagementPage() {
                     <p className="mt-2 text-sm text-slate-600">
                       {selectedCase.recommendation
                         ? [
-                            selectedCase.recommendation.distanceKm != null ? `${selectedCase.recommendation.distanceKm.toFixed(1)} km away` : 'Distance unavailable',
+                            selectedCase.recommendation.gridDistance != null ? `${selectedCase.recommendation.gridDistance} H3 cells away` : 'Distance unavailable',
                             selectedCase.recommendation.loadLabel,
                             `Status ${safeString(selectedCase.recommendation.status)}`,
                           ].join(' · ')

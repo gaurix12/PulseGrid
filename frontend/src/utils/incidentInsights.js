@@ -1,3 +1,5 @@
+import { gridDistance, latLngToCell } from 'h3-js'
+
 const SEVERITY_RANK = {
   P0: 0,
   P1: 1,
@@ -50,7 +52,7 @@ export function parseCaseCoordinates(caseItem) {
   return null
 }
 
-export function haversineKm(from, to) {
+export function h3GridDistance(from, to) {
   if (!from || !to) return null
 
   const lat1 = safeNumber(from.latitude, Number.NaN)
@@ -59,15 +61,11 @@ export function haversineKm(from, to) {
   const lon2 = safeNumber(to.longitude, Number.NaN)
   if (![lat1, lon1, lat2, lon2].every(Number.isFinite)) return null
 
-  const toRadians = (degrees) => (degrees * Math.PI) / 180
-  const radiusKm = 6371
-  const deltaLat = toRadians(lat2 - lat1)
-  const deltaLon = toRadians(lon2 - lon1)
-  const a =
-    Math.sin(deltaLat / 2) ** 2 +
-    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(deltaLon / 2) ** 2
-
-  return 2 * radiusKm * Math.asin(Math.sqrt(a))
+  try {
+    return gridDistance(latLngToCell(lat1, lon1, 9), latLngToCell(lat2, lon2, 9))
+  } catch {
+    return null
+  }
 }
 
 export function formatTimeAgo(value) {
@@ -97,8 +95,8 @@ export function sortCasesByPriority(cases, origin = null) {
     const severityDiff = (SEVERITY_RANK[left.severity] ?? 99) - (SEVERITY_RANK[right.severity] ?? 99)
     if (severityDiff !== 0) return severityDiff
 
-    const leftDistance = origin ? haversineKm(origin, parseCaseCoordinates(left)) ?? Number.POSITIVE_INFINITY : 0
-    const rightDistance = origin ? haversineKm(origin, parseCaseCoordinates(right)) ?? Number.POSITIVE_INFINITY : 0
+    const leftDistance = origin ? h3GridDistance(origin, parseCaseCoordinates(left)) ?? Number.POSITIVE_INFINITY : 0
+    const rightDistance = origin ? h3GridDistance(origin, parseCaseCoordinates(right)) ?? Number.POSITIVE_INFINITY : 0
     if (leftDistance !== rightDistance) return leftDistance - rightDistance
 
     const leftCreated = left.created_at ? new Date(left.created_at).getTime() : 0
@@ -160,10 +158,10 @@ export function buildAuditTrail(cases) {
 
 export function buildCaseQueue(cases, origin = null) {
   return sortCasesByPriority(cases, origin).map((item) => {
-    const distance = origin ? haversineKm(origin, parseCaseCoordinates(item)) : null
+    const distance = origin ? h3GridDistance(origin, parseCaseCoordinates(item)) : null
     return {
       ...item,
-      distanceKm: distance,
+      h3GridDistance: distance,
       ageMinutes: getCaseAgeMinutes(item),
     }
   })

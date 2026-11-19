@@ -3,10 +3,10 @@ try:
     from langchain_core.output_parsers import StructuredOutputParser, ResponseSchema
 except Exception:
     from ..utils.langchain_compat import StructuredOutputParser, ResponseSchema
-import math
 from typing import Any
 from ..models import Ambulance, Case, Hospital, Logs, db
 from ..tools.langchain_tools import recommend_ambulance_for_case, recommend_hospital_for_case
+from ..utils.h3 import compute_h3_from_location, h3_grid_distance
 # case ->ambulance,hospital
 
 DISPATCH_GUARDRAILS = """You are an emergency dispatch system agent. Your role is to select the best ambulance and hospital combination for incoming cases.
@@ -64,27 +64,6 @@ Return ONLY valid JSON that matches the format instructions below.
     # take case -> list of available ambulance that are idle, or worst case assigned  -> list of hospitals(filter available icu, ventilator > capacity) -> return best ambulance 
     
     
-    def calculate_distance(self, loc1: str, loc2: str) -> float:
-        if not loc1 or not loc2:
-            return 9999
-
-        try:
-            lat1, lon1 = map(float, loc1.split(","))
-            lat2, lon2 = map(float, loc2.split(","))
-        except (ValueError, AttributeError):
-            return 9999
-        r = 6371
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-
-        a = (
-            math.sin(dlat / 2) ** 2 +
-            math.cos(math.radians(lat1)) *
-            math.cos(math.radians(lat2)) *
-            math.sin(dlon / 2) ** 2
-        )
-
-        return r * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
     
     def dispatch(self, case, location):
         try:
@@ -140,8 +119,11 @@ Return ONLY valid JSON that matches the format instructions below.
         formatted = []
         for amb in ambulances:
             amb_location = f"{amb.current_latitude},{amb.current_longitude}"
-            dist = self.calculate_distance(amb_location, location)
-            formatted.append(f"ID: {amb.id}, Status: {amb.status}, Distance: {dist:.2f} km")
+            dist = h3_grid_distance(
+                getattr(amb, "h3_index", None) or compute_h3_from_location(amb_location),
+                compute_h3_from_location(location),
+            )
+            formatted.append(f"ID: {amb.id}, Status: {amb.status}, H3 grid distance: {dist if dist is not None else 'unknown'} cells")
         return "\n".join(formatted)
     def format_hospitals(self, hospitals, location):
         formatted = []
@@ -150,8 +132,11 @@ Return ONLY valid JSON that matches the format instructions below.
             if hosp_lat is None:
                 hosp_lat = getattr(hosp, 'latitude', None)
             hosp_location = f"{hosp_lat},{hosp.longitude}"
-            dist = self.calculate_distance(hosp_location, location)
-            formatted.append(f"ID: {hosp.id}, Name: {hosp.name}, Beds: {hosp.beds_available}/{hosp.beds_total}, ICU: {hosp.icu_available}/{hosp.icu_total}, Ventilators: {hosp.ventilators_available}/{hosp.ventilators_total}, Distance: {dist:.2f} km")
+            dist = h3_grid_distance(
+                getattr(hosp, "h3_index", None) or compute_h3_from_location(hosp_location),
+                compute_h3_from_location(location),
+            )
+            formatted.append(f"ID: {hosp.id}, Name: {hosp.name}, Beds: {hosp.beds_available}/{hosp.beds_total}, ICU: {hosp.icu_available}/{hosp.icu_total}, Ventilators: {hosp.ventilators_available}/{hosp.ventilators_total}, H3 grid distance: {dist if dist is not None else 'unknown'} cells")
         return "\n".join(formatted)
 
     #fallback: simple rules - nearest ambulance, hospital with resources, log reasoning for audit

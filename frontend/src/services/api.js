@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { AUTH_STORAGE_KEY, useAuthStore } from '../store/authStore.js'
+import { useAuthStore } from '../store/authStore.js'
 import { useUiStore } from '../store/uiStore.js'
 
 const baseURL = import.meta.env.VITE_API_URL || ''
@@ -13,29 +13,7 @@ export const apiClient = axios.create({
   },
 })
 
-// ── Auth token injection ─────────────────────────────────────────────────────
-apiClient.interceptors.request.use((config) => {
-  let token = useAuthStore.getState().token
-
-  if (!token && typeof window !== 'undefined') {
-    try {
-      const raw = window.localStorage.getItem(AUTH_STORAGE_KEY)
-      if (raw) {
-        const parsed = JSON.parse(raw)
-        token = parsed?.token || null
-      }
-    } catch {
-      token = null
-    }
-  }
-  
-
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
-  }
-
-  return config
-})
+// Authentication is maintained with the Flask session cookie.
 
 // ── Global error handler ─────────────────────────────────────────────────────
 apiClient.interceptors.response.use(
